@@ -564,8 +564,8 @@ static CYTHON_INLINE float __PYX_NAN() {
 /* Early includes */
 #include <string.h>
 #include <stdio.h>
-#include "/home/heecheol/anaconda3/envs/tf35/lib/python3.5/site-packages/numpy/core/include/numpy/arrayobject.h"
-#include "/home/heecheol/anaconda3/envs/tf35/lib/python3.5/site-packages/numpy/core/include/numpy/ufuncobject.h"
+#include "numpy/arrayobject.h"
+#include "numpy/ufuncobject.h"
 #include <stdint.h>
 #ifdef _OPENMP
 #include <omp.h>

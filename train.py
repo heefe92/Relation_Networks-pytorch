@@ -43,15 +43,14 @@ testset = TestDataset(opt)
 test_dataloader = data_.DataLoader(testset,
                                    batch_size=opt.batch_size,
                                    num_workers=opt.num_workers,
-                                   shuffle=False, \
-                                   pin_memory=True
+                                   shuffle=False#, \
+                                   #pin_memory=True
                                    )
 
 resnet = model.resnet18(20,True)
 resnet = resnet.cuda()
 resnet = torch.nn.DataParallel(resnet).cuda()
-resnet.load_state_dict(torch.load('Weights/resnet_15.pt'))
-
+resnet.load_state_dict(torch.load('Weights/resnet_69.pt'))
 
 optimizer = optim.Adam(resnet.parameters(), lr=opt.lr)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
@@ -63,7 +62,7 @@ resnet.module.use_preset(isTraining=True)
 resnet.module.freeze_bn()
 
 epoch_loss_hist = []
-for epoch_num in range(16,opt.epoch):
+for epoch_num in range(72,opt.epoch):
 
     resnet.train()
     resnet.module.use_preset(isTraining=True)
@@ -82,12 +81,13 @@ for epoch_num in range(16,opt.epoch):
         loss_hist.append(float(curr_loss))
 
         epoch_loss.append(float(curr_loss))
-        if(iter_num % 5000==4999):
+        if(iter_num % 12000==11999):
             print('Epoch: {} | Iteration: {} | loss: {:1.5f} | Running loss: {:1.5f}'.format(
                     epoch_num, iter_num, float(curr_loss), np.mean(loss_hist)))
 
         del curr_loss
-
+    print('Epoch: {} | epoch loss: {:1.5f}'.format(
+        epoch_num, np.mean(epoch_loss)))
     scheduler.step(np.mean(epoch_loss))
     epoch_loss_hist.append(np.mean(epoch_loss))
 

@@ -207,12 +207,13 @@ class ResNet(nn.Module):
             img = t.autograd.Variable(at.totensor(img).float()[None], volatile=True)
             scale = img.shape[3] / size[1]
             roi_cls_loc, roi_scores, rois, _ = self(img, scale=scale)
-
             # We are assuming that batch size is 1.
             roi_score = roi_scores.data
             roi_cls_loc = roi_cls_loc.data
-
-            roi = at.totensor(rois) / scale.cuda().float()
+            if visualize:
+                roi = at.totensor(rois) / scale
+            else:
+                roi = at.totensor(rois) / scale.cuda().float()
 
             # Convert predictions to bounding boxes in image coordinates.
             # Bounding boxes are scaled to the scale of the input images.
@@ -614,7 +615,7 @@ class RoI(Function):
                          stream=stream
                          )
         return grad_input, None
-class RoIPooling2D(t.nn.Module):
+class RoIPooling2D(nn.Module):
 
     def __init__(self, outh, outw, spatial_scale):
         super(RoIPooling2D, self).__init__()
@@ -622,6 +623,11 @@ class RoIPooling2D(t.nn.Module):
 
     def forward(self, x, rois):
         return self.RoI(x, rois)
+class Relation(nn.Module):
+    def __init__(self,n_relations = 16, key_feature_dim = 64, geo_feature_dim = 64):
+        super(Relation, self).__init__()
+
+
 class RoIHead(nn.Module):
     """Faster R-CNN Head for VGG-16 based implementation.
     This class is used as a head for Faster R-CNN.
@@ -637,7 +643,7 @@ class RoIHead(nn.Module):
     """
 
     def __init__(self, n_class, roi_size, spatial_scale,
-                 in_channels,fc_features):
+                 in_channels = 128,fc_features = 1024):
         # n_class includes the background
         super(RoIHead, self).__init__()
 
