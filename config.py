@@ -17,6 +17,7 @@ class Config:
     # training
     epoch = 100
 
+    #The batch size can still only one.
     batch_size=1
 
 

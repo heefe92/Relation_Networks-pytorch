@@ -45,4 +45,6 @@ resnet.load_state_dict(torch.load('Weights/resnet_15.pt'))
 resnet.eval()
 
 eval_result = eval(test_dataloader, resnet, test_num=10000)
+
+
 print('eval_result : ',eval_result)

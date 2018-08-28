@@ -627,7 +627,6 @@ class Relation(nn.Module):
     def __init__(self,n_relations = 16, key_feature_dim = 64, geo_feature_dim = 64):
         super(Relation, self).__init__()
 
-
 class RoIHead(nn.Module):
     """Faster R-CNN Head for VGG-16 based implementation.
     This class is used as a head for Faster R-CNN.

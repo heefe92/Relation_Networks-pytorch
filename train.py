@@ -50,7 +50,7 @@ test_dataloader = data_.DataLoader(testset,
 resnet = model.resnet18(20,True)
 resnet = resnet.cuda()
 resnet = torch.nn.DataParallel(resnet).cuda()
-resnet.load_state_dict(torch.load('Weights/resnet_69.pt'))
+#resnet.load_state_dict(torch.load('Weights/resnet_69.pt'))
 
 optimizer = optim.Adam(resnet.parameters(), lr=opt.lr)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
