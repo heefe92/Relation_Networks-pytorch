@@ -6,10 +6,12 @@ import model
 
 import torch
 import torch.optim as optim
-
+from data.dataset import inverse_normalize
 from lib.eval_tool import eval_detection_voc
 from data.dataset import Dataset, TestDataset
 from config import opt
+import cv2
+
 
 def eval(dataloader, resnet, test_num=10000):
     pred_bboxes, pred_labels, pred_scores = list(), list(), list()
@@ -35,7 +37,7 @@ def eval(dataloader, resnet, test_num=10000):
 dataset=Dataset(opt)
 dataloader = data_.DataLoader(dataset, \
                                   batch_size=opt.batch_size, \
-                                  shuffle=True, \
+                                  shuffle=False, \
                                   # pin_memory=True,
                                   num_workers=opt.num_workers)
 
@@ -50,7 +52,8 @@ test_dataloader = data_.DataLoader(testset,
 resnet = model.resnet18(20,True)
 resnet = resnet.cuda()
 resnet = torch.nn.DataParallel(resnet).cuda()
-#resnet.load_state_dict(torch.load('Weights/resnet_69.pt'))
+#test
+#resnet.load_state_dict(torch.load('Weights/resnet_99.pt'))
 
 optimizer = optim.Adam(resnet.parameters(), lr=opt.lr)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
@@ -62,13 +65,15 @@ resnet.module.use_preset(isTraining=True)
 resnet.module.freeze_bn()
 
 epoch_loss_hist = []
-for epoch_num in range(72,opt.epoch):
+for epoch_num in range(opt.epoch):
 
     resnet.train()
     resnet.module.use_preset(isTraining=True)
     resnet.module.freeze_bn()
     epoch_loss = []
     for iter_num, data in enumerate(dataloader):
+        print(data[0].shape)
+
         optimizer.zero_grad()
         losses = resnet([data[0].cuda().float(),data[1].cuda().float(),data[2].cuda().float(),data[3].cuda().float()])
         losses[4].backward()
@@ -81,16 +86,20 @@ for epoch_num in range(72,opt.epoch):
         loss_hist.append(float(curr_loss))
 
         epoch_loss.append(float(curr_loss))
+
+        cv2.imshow('test',inverse_normalize(np.array(data[0][0,0,:,:]))/255)
+        cv2.waitKey(0)
+
         if(iter_num % 12000==11999):
             print('Epoch: {} | Iteration: {} | loss: {:1.5f} | Running loss: {:1.5f}'.format(
                     epoch_num, iter_num, float(curr_loss), np.mean(loss_hist)))
 
         del curr_loss
+
     print('Epoch: {} | epoch loss: {:1.5f}'.format(
         epoch_num, np.mean(epoch_loss)))
     scheduler.step(np.mean(epoch_loss))
     epoch_loss_hist.append(np.mean(epoch_loss))
-
     if(epoch_num%3==0):
         resnet.eval()
 

@@ -148,14 +148,12 @@ class ResNet(nn.Module):
                 at.tonumpy(bboxes[0]),
                 anchor,
                 img_size)
-
             sample_roi, gt_roi_loc, gt_roi_label = self.proposal_target_creator(
                 rois,
                 at.tonumpy(bboxes[0]),
                 at.tonumpy(labels[0]),
                 self.loc_normalize_mean,
                 self.loc_normalize_std)
-
             sample_roi_index = t.zeros(len(sample_roi))
             roi_cls_loc, roi_score = self.roi_head(features, sample_roi, sample_roi_index)
 
@@ -578,9 +576,9 @@ class RoI(Function):
         # NOTE: MAKE SURE input is contiguous too
         x = x.contiguous()
         rois = rois.contiguous()
-        self.in_size = B, C, H, W = x.size()
-        self.N = N = rois.size(0)
-        output = t.zeros(N, C, self.outh, self.outw).cuda()
+        self.in_size = B, C, H, W = x.size() ## 1, 128, heights/32, width/32
+        self.N = N = rois.size(0) ## 128
+        output = t.zeros(N, C, self.outh, self.outw).cuda() ## 128,128,7,7
         self.argmax_data = t.zeros(N, C, self.outh, self.outw).int().cuda()
         self.rois = rois
         args = [x.data_ptr(), rois.data_ptr(),
@@ -626,6 +624,67 @@ class RoIPooling2D(nn.Module):
 class Relation(nn.Module):
     def __init__(self,n_relations = 16, key_feature_dim = 64, geo_feature_dim = 64):
         super(Relation, self).__init__()
+        self.Nr = n_relations
+        self.dim_g = geo_feature_dim
+
+        self.WG_0 = nn.Linear(geo_feature_dim, 1)
+        self.relu_0 = nn.ReLU(inplace=True)
+
+
+    def forward(self, f_a, f_g):
+        N,_ = f_a.size()
+        position_embedding = self.embedding(f_g)
+
+        position_embedding = position_embedding.view(-1,self.dim_g)
+        print(position_embedding.size())
+        w_g_0 = self.relu_0(self.WG_0(position_embedding))
+
+        print(w_g_0.size())
+    def embedding(self,f_g, wave_len=1000):
+        f_g = f_g[:,1:]
+        x_min,y_min,x_max,y_max = torch.chunk(f_g, 4, dim=1)
+
+        cx = (x_min+x_max)*0.5
+        cy = (y_min + y_max) * 0.5
+        w = (x_max - x_min) +1.
+        h = (y_max - y_min) +1.
+
+        delta_x = cx - cx.view(1, -1)
+        delta_x = torch.clamp(torch.abs(delta_x / w), min = 1e-3)
+        delta_x = torch.log(delta_x)
+
+        delta_y = cy - cy.view(1, -1)
+        delta_y = torch.clamp(torch.abs(delta_y / h), min = 1e-3)
+        delta_y = torch.log(delta_y)
+
+        delta_w = torch.log(w / w.view(1,-1))
+        delta_h = torch.log(h / h.view(1, -1))
+        size = delta_h.size()
+
+        delta_x = delta_x.view(size[0],size[1],1)
+        delta_y = delta_y.view(size[0],size[1],1)
+        delta_w = delta_w.view(size[0],size[1],1)
+        delta_h = delta_h.view(size[0],size[1],1)
+
+        position_mat = torch.cat((delta_x,delta_y,delta_w,delta_h),-1)
+
+        feat_range = torch.arange(self.dim_g/8).cuda()
+        dim_mat = feat_range/ (self.dim_g/8)
+        dim_mat = 1. / (torch.pow(wave_len,dim_mat))
+
+
+
+        dim_mat = dim_mat.view(1,1,1,-1)
+        position_mat = position_mat.view(size[0],size[1],4,-1)
+        position_mat = 100. * position_mat
+
+        mul_mat = position_mat * dim_mat
+        mul_mat = mul_mat.view(size[0],size[1],-1)
+        sin_mat = torch.sin(mul_mat)
+        cos_mat = torch.cos(mul_mat)
+        embedding = torch.cat((sin_mat,cos_mat),-1)
+
+        return embedding
 
 class RoIHead(nn.Module):
     """Faster R-CNN Head for VGG-16 based implementation.
@@ -648,13 +707,13 @@ class RoIHead(nn.Module):
 
         self.fully_connected1 = nn.Linear(7*7*in_channels, fc_features)
         self.relu1 = nn.ReLU(inplace=True)
+        self.relation1= Relation()
 
         self.fully_connected2 = nn.Linear(fc_features, fc_features)
         self.relu2 = nn.ReLU(inplace=True)
 
         self.cls_loc = nn.Linear(fc_features, n_class * 4)
         self.score = nn.Linear(fc_features, n_class)
-
 
         self.n_class = n_class
         self.roi_size = roi_size
@@ -679,6 +738,7 @@ class RoIHead(nn.Module):
 
         """
         # in case roi_indices is  ndarray
+        print('rois shape : ',rois.shape)
         roi_indices = at.totensor(roi_indices).float()
         rois = at.totensor(rois).float()
         indices_and_rois = t.cat([roi_indices[:, None], rois], dim=1)
@@ -686,10 +746,13 @@ class RoIHead(nn.Module):
         xy_indices_and_rois = indices_and_rois[:, [0, 2, 1, 4, 3]]
         indices_and_rois = t.autograd.Variable(xy_indices_and_rois.contiguous())
         pool = self.roi(x, indices_and_rois)
+
         pool = pool.view(pool.size(0), -1)
         fc1 = self.fully_connected1(pool)
         fc1 = self.relu1(fc1)
         ##Relation Module을 넣어보자..!
+        self.relation1(fc1,indices_and_rois)
+
 
         fc2 = self.fully_connected2(fc1)
         fc2 = self.relu2(fc2)
