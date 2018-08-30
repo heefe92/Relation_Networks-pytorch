@@ -1,10 +1,10 @@
 
 class Config:
     # data
-    voc_data_dir = '/media/heecheol/새 볼륨/DataSet/VOC2007/'
+    voc_data_dir = '/media/heecheol/새 볼륨/DataSet/VOC2012/'
     min_size = 608  # image resize
     max_size = 1024 # image resize
-    num_workers = 8
+    num_workers = 16
 
     # sigma for l1_smooth_loss
     rpn_sigma = 3.

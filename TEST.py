@@ -29,7 +29,6 @@ def eval(dataloader, resnet, test_num=10000):
         use_07_metric=True)
     return result
 
-
 testset = TestDataset(opt)
 test_dataloader = data_.DataLoader(testset,
                                     batch_size=opt.batch_size,
@@ -40,11 +39,11 @@ test_dataloader = data_.DataLoader(testset,
 resnet = model.resnet18(20,True)
 resnet = resnet.cuda()
 resnet = torch.nn.DataParallel(resnet).cuda()
-resnet.load_state_dict(torch.load('Weights/resnet_15.pt'))
+resnet.load_state_dict(torch.load('Weights/resnet18_Relation_90.pt'))
 
 resnet.eval()
 
-eval_result = eval(test_dataloader, resnet, test_num=10000)
+eval_result = eval(test_dataloader, resnet, test_num=5000)
 
 
 print('eval_result : ',eval_result)

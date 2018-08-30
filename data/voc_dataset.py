@@ -62,7 +62,7 @@ class VOCBboxDataset:
 
     """
 
-    def __init__(self, data_dir, split='trainval',
+    def __init__(self, data_dir, split='train',
                  use_difficult=False, return_difficult=False,
                  ):
 

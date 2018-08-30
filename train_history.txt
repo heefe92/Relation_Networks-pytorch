@@ -1,0 +1,19 @@
+resnet : 18
+fpn : feature_size 64
+rpn : mid 32
+roi_head : roi_size 7, fc_features 256, n_relations 4
+
+train iter time : 0.09s
+inference time : 0.05s
+weights file name : 
+
+----------------------------------------------------------
+
+resnet : 50
+fpn : feature_size 512
+rpn : mid 512
+roi_head : roi_size 7, fc_features 1024, n_relations 0
+
+train iter time : 0.25s
+inference time : 
+weights file name : 

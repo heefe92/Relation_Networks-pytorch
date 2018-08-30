@@ -10,7 +10,7 @@ from data.dataset import inverse_normalize
 from lib.eval_tool import eval_detection_voc
 from data.dataset import Dataset, TestDataset
 from config import opt
-import cv2
+import cv2,time
 
 
 def eval(dataloader, resnet, test_num=10000):
@@ -34,77 +34,79 @@ def eval(dataloader, resnet, test_num=10000):
         use_07_metric=True)
     return result
 
-dataset=Dataset(opt)
-dataloader = data_.DataLoader(dataset, \
-                                  batch_size=opt.batch_size, \
-                                  shuffle=False, \
-                                  # pin_memory=True,
-                                  num_workers=opt.num_workers)
 
-testset = TestDataset(opt)
-test_dataloader = data_.DataLoader(testset,
-                                   batch_size=opt.batch_size,
-                                   num_workers=opt.num_workers,
-                                   shuffle=False#, \
-                                   #pin_memory=True
-                                   )
+def run_train():
+    dataset = Dataset(opt)
+    dataloader = data_.DataLoader(dataset, \
+                                      batch_size=opt.batch_size, \
+                                      shuffle=True, \
+                                      # pin_memory=True,
+                                      num_workers=opt.num_workers)
 
-resnet = model.resnet18(20,True)
-resnet = resnet.cuda()
-resnet = torch.nn.DataParallel(resnet).cuda()
-#test
-#resnet.load_state_dict(torch.load('Weights/resnet_99.pt'))
+    testset = TestDataset(opt)
+    test_dataloader = data_.DataLoader(testset,
+                                       batch_size=opt.batch_size,
+                                       num_workers=opt.num_workers,
+                                       shuffle=False#, \
+                                       #pin_memory=True
+                                       )
 
-optimizer = optim.Adam(resnet.parameters(), lr=opt.lr)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
+    resnet = model.resnet50(20,True)
+    resnet = resnet.cuda()
+    resnet = torch.nn.DataParallel(resnet).cuda()
 
-loss_hist = collections.deque(maxlen=500)
+    #resnet.load_state_dict(torch.load('Weights/resnet18_Relation_6.pt'))
 
-resnet.train()
-resnet.module.use_preset(isTraining=True)
-resnet.module.freeze_bn()
+    optimizer = optim.Adam(resnet.parameters(), lr=opt.lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
 
-epoch_loss_hist = []
-for epoch_num in range(opt.epoch):
+    loss_hist = collections.deque(maxlen=500)
 
     resnet.train()
     resnet.module.use_preset(isTraining=True)
     resnet.module.freeze_bn()
-    epoch_loss = []
-    for iter_num, data in enumerate(dataloader):
-        print(data[0].shape)
 
-        optimizer.zero_grad()
-        losses = resnet([data[0].cuda().float(),data[1].cuda().float(),data[2].cuda().float(),data[3].cuda().float()])
-        losses[4].backward()
+    epoch_loss_hist = []
+    for epoch_num in range(7,opt.epoch):
+        start= time.time()
+        resnet.train()
+        resnet.module.use_preset(isTraining=True)
+        resnet.module.freeze_bn()
+        epoch_loss = []
+        for iter_num, data in enumerate(dataloader):
+            optimizer.zero_grad()
+            losses = resnet([data[0].cuda().float(),data[1].cuda().float(),data[2].cuda().float(),data[3].cuda().float()])
+            losses[4].backward()
+            torch.nn.utils.clip_grad_norm_(resnet.parameters(), 0.1)
 
-        torch.nn.utils.clip_grad_norm_(resnet.parameters(), 0.1)
+            optimizer.step()
 
-        optimizer.step()
+            curr_loss=losses[4].item()
+            loss_hist.append(float(curr_loss))
 
-        curr_loss=losses[4].item()
-        loss_hist.append(float(curr_loss))
+            epoch_loss.append(float(curr_loss))
+            # cv2.imshow('test',inverse_normalize(np.array(data[0][0,0]))/255)
+            # cv2.waitKey(0)
+            if(iter_num % 12000==11999):
+                print('Epoch: {} | Iteration: {} | loss: {:1.5f} | Running loss: {:1.5f}'.format(
+                        epoch_num, iter_num, float(curr_loss), np.mean(loss_hist)))
 
-        epoch_loss.append(float(curr_loss))
+            del curr_loss
+        print('1epoch time :',time.time()-start)
+        print('Epoch: {} | epoch loss: {:1.5f}'.format(
+            epoch_num, np.mean(epoch_loss)))
+        scheduler.step(np.mean(epoch_loss))
+        epoch_loss_hist.append(np.mean(epoch_loss))
+        if(epoch_num%3==0):
+            resnet.eval()
+            if(epoch_num<30):
+                eval_result = eval(test_dataloader, resnet, test_num=1000)
+            else :
+                eval_result = eval(test_dataloader, resnet, test_num=10000)
+            print(epoch_num,'_eval_result : ', eval_result)
+            torch.save(resnet.state_dict(), 'Weights/resnet18_Relation_{}.pt'.format(epoch_num))
 
-        cv2.imshow('test',inverse_normalize(np.array(data[0][0,0,:,:]))/255)
-        cv2.waitKey(0)
+    print(epoch_loss_hist)
 
-        if(iter_num % 12000==11999):
-            print('Epoch: {} | Iteration: {} | loss: {:1.5f} | Running loss: {:1.5f}'.format(
-                    epoch_num, iter_num, float(curr_loss), np.mean(loss_hist)))
-
-        del curr_loss
-
-    print('Epoch: {} | epoch loss: {:1.5f}'.format(
-        epoch_num, np.mean(epoch_loss)))
-    scheduler.step(np.mean(epoch_loss))
-    epoch_loss_hist.append(np.mean(epoch_loss))
-    if(epoch_num%3==0):
-        resnet.eval()
-
-        eval_result = eval(test_dataloader, resnet, test_num=10000)
-        print(epoch_num,'_eval_result : ', eval_result)
-        torch.save(resnet.state_dict(), 'Weights/resnet_{}.pt'.format(epoch_num))
-
-print(epoch_loss_hist)
+if __name__=="__main__":
+    run_train()

@@ -46,7 +46,6 @@ CUDA_NUM_THREADS = 1024
 
 def GET_BLOCKS(N, K=CUDA_NUM_THREADS):
     return (N + K - 1) // K
-
 class ResNet(nn.Module):
     feat_stride = 32  # downsample 32x for output of convolution resnet
     def __init__(self, num_classes, block, layers):
@@ -73,10 +72,10 @@ class ResNet(nn.Module):
             fpn_sizes = [self.layer2[layers[1]-1].conv3.out_channels, self.layer3[layers[2]-1].conv3.out_channels,
                          self.layer4[layers[3]-1].conv3.out_channels]
 
-        self.fpn = PyramidFeatures(fpn_sizes[0], fpn_sizes[1], fpn_sizes[2],feature_size = 128)
-        self.rpn = RegionProposalNetwork(in_channels=128,mid_channels=128,feat_stride = self.feat_stride)
+        self.fpn = PyramidFeatures(fpn_sizes[0], fpn_sizes[1], fpn_sizes[2],feature_size = 512)
+        self.rpn = RegionProposalNetwork(in_channels=512,mid_channels=512,feat_stride = self.feat_stride)
         self.roi_head = RoIHead(n_class = num_classes+1,roi_size=7,spatial_scale=(1. / self.feat_stride),
-                                in_channels=128,fc_features = 1024)
+                                in_channels=512,fc_features = 1024, n_relations= 0)
 
         self.proposal_target_creator = ProposalTargetCreator()
         self.anchor_target_creator = AnchorTargetCreator()
@@ -139,8 +138,8 @@ class ResNet(nn.Module):
         x2 = self.layer2(x1)
         x3 = self.layer3(x2)
         x4 = self.layer4(x3)
-
         features = self.fpn([x2, x3, x4])
+
         rpn_locs, rpn_scores, rois, roi_indices, anchor = self.rpn(features,img_size,scale)
 
         if self.training:
@@ -156,7 +155,6 @@ class ResNet(nn.Module):
                 self.loc_normalize_std)
             sample_roi_index = t.zeros(len(sample_roi))
             roi_cls_loc, roi_score = self.roi_head(features, sample_roi, sample_roi_index)
-
 
             return self.Loss(gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores)
         else:
@@ -244,8 +242,6 @@ class ResNet(nn.Module):
         # self.use_preset('evaluate')
         # self.train()
         return bboxes, labels, scores
-
-
 class RegionProposalNetwork(nn.Module):
     """Region Proposal Network introduced in Faster R-CNN.
 
@@ -621,71 +617,69 @@ class RoIPooling2D(nn.Module):
 
     def forward(self, x, rois):
         return self.RoI(x, rois)
-class Relation(nn.Module):
-    def __init__(self,n_relations = 16, key_feature_dim = 64, geo_feature_dim = 64):
-        super(Relation, self).__init__()
+
+class DuplicationRemovalNetwork(nn.Module):
+    pass
+class RelationModule(nn.Module):
+    def __init__(self,n_relations = 16, appearance_feature_dim=1024,key_feature_dim = 64, geo_feature_dim = 64):
+        super(RelationModule, self).__init__()
         self.Nr = n_relations
         self.dim_g = geo_feature_dim
+        self.relation = nn.ModuleList()
+        for N in range(self.Nr):
+            self.relation.append(RelationUnit(appearance_feature_dim, key_feature_dim, geo_feature_dim))
+    def forward(self, f_a, position_embedding):
+        isFirst=True
+        for N in range(self.Nr):
+            if(isFirst):
+                concat = self.relation[N](f_a,position_embedding)
+                isFirst=False
+            else:
+                concat = torch.cat((concat,self.relation[N](f_a,position_embedding)),-1)
+        return concat+f_a
+class RelationUnit(nn.Module):
+    def __init__(self, appearance_feature_dim=1024,key_feature_dim = 64, geo_feature_dim = 64):
+        super(RelationUnit, self).__init__()
+        self.dim_g = geo_feature_dim
+        self.dim_k = key_feature_dim
+        self.WG = nn.Linear(geo_feature_dim, 1, bias=True)
+        self.WK = nn.Linear(appearance_feature_dim, key_feature_dim, bias=True)
+        self.WQ = nn.Linear(appearance_feature_dim, key_feature_dim, bias=True)
+        self.WV = nn.Linear(appearance_feature_dim, key_feature_dim, bias=True)
+        self.relu = nn.ReLU(inplace=True)
 
-        self.WG_0 = nn.Linear(geo_feature_dim, 1)
-        self.relu_0 = nn.ReLU(inplace=True)
 
-
-    def forward(self, f_a, f_g):
+    def forward(self, f_a, position_embedding):
         N,_ = f_a.size()
-        position_embedding = self.embedding(f_g)
 
         position_embedding = position_embedding.view(-1,self.dim_g)
-        print(position_embedding.size())
-        w_g_0 = self.relu_0(self.WG_0(position_embedding))
 
-        print(w_g_0.size())
-    def embedding(self,f_g, wave_len=1000):
-        f_g = f_g[:,1:]
-        x_min,y_min,x_max,y_max = torch.chunk(f_g, 4, dim=1)
+        w_g = self.relu(self.WG(position_embedding))
 
-        cx = (x_min+x_max)*0.5
-        cy = (y_min + y_max) * 0.5
-        w = (x_max - x_min) +1.
-        h = (y_max - y_min) +1.
+        w_k = self.WK(f_a)
+        w_k = w_k.view(N,1,self.dim_k)
 
-        delta_x = cx - cx.view(1, -1)
-        delta_x = torch.clamp(torch.abs(delta_x / w), min = 1e-3)
-        delta_x = torch.log(delta_x)
+        w_q = self.WQ(f_a)
+        w_q = w_q.view(1,N,self.dim_k)
 
-        delta_y = cy - cy.view(1, -1)
-        delta_y = torch.clamp(torch.abs(delta_y / h), min = 1e-3)
-        delta_y = torch.log(delta_y)
+        scaled_dot = torch.sum((w_k*w_q),-1 )
+        scaled_dot = scaled_dot / np.sqrt(self.dim_k)
 
-        delta_w = torch.log(w / w.view(1,-1))
-        delta_h = torch.log(h / h.view(1, -1))
-        size = delta_h.size()
+        w_g = w_g.view(N,N)
+        w_a = scaled_dot.view(N,N)
 
-        delta_x = delta_x.view(size[0],size[1],1)
-        delta_y = delta_y.view(size[0],size[1],1)
-        delta_w = delta_w.view(size[0],size[1],1)
-        delta_h = delta_h.view(size[0],size[1],1)
+        w_mn = torch.log(torch.clamp(w_g, min = 1e-6)) + w_a
+        w_mn = torch.nn.Softmax(dim=1)(w_mn)
 
-        position_mat = torch.cat((delta_x,delta_y,delta_w,delta_h),-1)
+        w_v = self.WV(f_a)
 
-        feat_range = torch.arange(self.dim_g/8).cuda()
-        dim_mat = feat_range/ (self.dim_g/8)
-        dim_mat = 1. / (torch.pow(wave_len,dim_mat))
+        w_mn = w_mn.view(N,N,1)
+        w_v = w_v.view(N,1,-1)
 
+        output = w_mn*w_v
 
-
-        dim_mat = dim_mat.view(1,1,1,-1)
-        position_mat = position_mat.view(size[0],size[1],4,-1)
-        position_mat = 100. * position_mat
-
-        mul_mat = position_mat * dim_mat
-        mul_mat = mul_mat.view(size[0],size[1],-1)
-        sin_mat = torch.sin(mul_mat)
-        cos_mat = torch.cos(mul_mat)
-        embedding = torch.cat((sin_mat,cos_mat),-1)
-
-        return embedding
-
+        output = torch.sum(output,-2)
+        return output
 class RoIHead(nn.Module):
     """Faster R-CNN Head for VGG-16 based implementation.
     This class is used as a head for Faster R-CNN.
@@ -701,16 +695,22 @@ class RoIHead(nn.Module):
     """
 
     def __init__(self, n_class, roi_size, spatial_scale,
-                 in_channels = 128,fc_features = 1024):
+                 in_channels = 128,fc_features = 1024, n_relations = 16):
         # n_class includes the background
         super(RoIHead, self).__init__()
-
+        self.n_relations=n_relations
         self.fully_connected1 = nn.Linear(7*7*in_channels, fc_features)
         self.relu1 = nn.ReLU(inplace=True)
-        self.relation1= Relation()
+        if(n_relations>0):
+            self.dim_g = int(fc_features/n_relations)
+            self.relation1= RelationModule(n_relations = n_relations, appearance_feature_dim=fc_features,
+                                       key_feature_dim = self.dim_g, geo_feature_dim = self.dim_g)
 
         self.fully_connected2 = nn.Linear(fc_features, fc_features)
         self.relu2 = nn.ReLU(inplace=True)
+        if(n_relations>0):
+            self.relation2= RelationModule(n_relations = n_relations, appearance_feature_dim=fc_features,
+                                       key_feature_dim = self.dim_g, geo_feature_dim = self.dim_g)
 
         self.cls_loc = nn.Linear(fc_features, n_class * 4)
         self.score = nn.Linear(fc_features, n_class)
@@ -738,31 +738,77 @@ class RoIHead(nn.Module):
 
         """
         # in case roi_indices is  ndarray
-        print('rois shape : ',rois.shape)
         roi_indices = at.totensor(roi_indices).float()
         rois = at.totensor(rois).float()
         indices_and_rois = t.cat([roi_indices[:, None], rois], dim=1)
         # NOTE: important: yx->xy
         xy_indices_and_rois = indices_and_rois[:, [0, 2, 1, 4, 3]]
         indices_and_rois = t.autograd.Variable(xy_indices_and_rois.contiguous())
+        if(self.n_relations>0):
+            position_embedding = self.embedding(indices_and_rois,dim_g = self.dim_g)
+
         pool = self.roi(x, indices_and_rois)
 
         pool = pool.view(pool.size(0), -1)
         fc1 = self.fully_connected1(pool)
         fc1 = self.relu1(fc1)
-        ##Relation Module을 넣어보자..!
-        self.relation1(fc1,indices_and_rois)
 
+        if(self.n_relations>0):
+            fc1 = self.relation1(fc1,position_embedding)
 
         fc2 = self.fully_connected2(fc1)
         fc2 = self.relu2(fc2)
-        ##Relation Module을 넣어보자..!
-
+        if(self.n_relations>0):
+            fc2 = self.relation2(fc2,position_embedding)
 
         roi_cls_locs = self.cls_loc(fc2)
         roi_scores = self.score(fc2)
         return roi_cls_locs, roi_scores
+    def embedding(self,f_g, wave_len=1000, dim_g=64):
+        f_g = f_g[:,1:]
+        x_min,y_min,x_max,y_max = torch.chunk(f_g, 4, dim=1)
 
+        cx = (x_min + x_max)* 0.5
+        cy = (y_min + y_max) * 0.5
+        w = (x_max - x_min) + 1.
+        h = (y_max - y_min) + 1.
+
+        delta_x = cx - cx.view(1, -1)
+        delta_x = torch.clamp(torch.abs(delta_x / w), min = 1e-3)
+        delta_x = torch.log(delta_x)
+
+        delta_y = cy - cy.view(1, -1)
+        delta_y = torch.clamp(torch.abs(delta_y / h), min = 1e-3)
+        delta_y = torch.log(delta_y)
+
+        delta_w = torch.log(w / w.view(1,-1))
+        delta_h = torch.log(h / h.view(1, -1))
+        size = delta_h.size()
+
+        delta_x = delta_x.view(size[0],size[1],1)
+        delta_y = delta_y.view(size[0],size[1],1)
+        delta_w = delta_w.view(size[0],size[1],1)
+        delta_h = delta_h.view(size[0],size[1],1)
+
+        position_mat = torch.cat((delta_x,delta_y,delta_w,delta_h),-1)
+
+        feat_range = torch.arange(dim_g/8).cuda()
+        dim_mat = feat_range/ (dim_g/8)
+        dim_mat = 1. / (torch.pow(wave_len,dim_mat))
+
+
+
+        dim_mat = dim_mat.view(1,1,1,-1)
+        position_mat = position_mat.view(size[0],size[1],4,-1)
+        position_mat = 100. * position_mat
+
+        mul_mat = position_mat * dim_mat
+        mul_mat = mul_mat.view(size[0],size[1],-1)
+        sin_mat = torch.sin(mul_mat)
+        cos_mat = torch.cos(mul_mat)
+        embedding = torch.cat((sin_mat,cos_mat),-1)
+
+        return embedding
 def resnet18(num_classes, pretrained=False, **kwargs):
     """Constructs a ResNet-18 model.
     Args:

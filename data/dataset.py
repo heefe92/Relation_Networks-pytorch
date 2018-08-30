@@ -11,7 +11,6 @@ def inverse_normalize(img):
     # approximate un-normalize for visualize
     return (img * 0.225 + 0.45).clip(min=0, max=1) * 255
 
-
 def normalize(img):
     """
     https://github.com/pytorch/vision/issues/223
@@ -22,8 +21,6 @@ def normalize(img):
     img = normalize(t.from_numpy(img))
 
     return img.numpy()
-
-
 
 def preprocess(img, min_size=600, max_size=1000):
     """Preprocess an image for feature extraction.
@@ -55,7 +52,6 @@ def preprocess(img, min_size=600, max_size=1000):
     # max_size and min_size
 
     return normalize(img)
-
 
 class Transform(object):
 
@@ -99,15 +95,14 @@ class Dataset:
 
 
 class TestDataset:
-    def __init__(self, opt, split='test', use_difficult=True):
-        self.VOCBboxDataset = VOCBboxDataset(opt.voc_data_dir)
+    def __init__(self, opt, split='val', use_difficult=True):
+        self.opt = opt
+        self.db = VOCBboxDataset(opt.voc_data_dir, split=split, use_difficult=use_difficult)
         self.Transform = Transform(opt.min_size, opt.max_size)
-
     def __getitem__(self, idx):
-        ori_img, bbox, label, difficult = self.VOCBboxDataset.get_example(idx)
+        ori_img, bbox, label, difficult = self.db.get_example(idx)
         img, bbox, label, scale = self.Transform((ori_img, bbox, label))
-
         return img.copy(), img.shape[1:], bbox.copy(), label.copy(), difficult.copy()
 
     def __len__(self):
-        return len(self.VOCBboxDataset)
+        return len(self.db)
