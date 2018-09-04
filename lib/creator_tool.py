@@ -101,6 +101,7 @@ class ProposalTargetCreator(object):
         # The label with value 0 is the background.
         gt_roi_label = label[gt_assignment] + 1
 
+
         # Select foreground RoIs as those with >= pos_iou_thresh IoU.
         pos_index = np.where(max_iou >= self.pos_iou_thresh)[0]
         pos_roi_per_this_image = int(min(pos_roi_per_image, pos_index.size))

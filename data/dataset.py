@@ -78,7 +78,7 @@ class Transform(object):
 
 class Dataset:
     def __init__(self, opt):
-        self.VOCBboxDataset = VOCBboxDataset(opt.voc_data_dir)
+        self.VOCBboxDataset = VOCBboxDataset(opt.voc_data_dir,split='trainval')
         self.Transform = Transform(opt.min_size, opt.max_size)
 
     def __getitem__(self, idx):
@@ -95,10 +95,10 @@ class Dataset:
 
 
 class TestDataset:
-    def __init__(self, opt, split='val', use_difficult=True):
+    def __init__(self, opt, split='test', use_difficult=True):
         self.opt = opt
         self.db = VOCBboxDataset(opt.voc_data_dir, split=split, use_difficult=use_difficult)
-        self.Transform = Transform(opt.min_size, opt.max_size)
+        self.Transform = Transform(800, 800)
     def __getitem__(self, idx):
         ori_img, bbox, label, difficult = self.db.get_example(idx)
         img, bbox, label, scale = self.Transform((ori_img, bbox, label))

@@ -72,7 +72,7 @@ class ResNet(nn.Module):
             fpn_sizes = [self.layer2[layers[1]-1].conv3.out_channels, self.layer3[layers[2]-1].conv3.out_channels,
                          self.layer4[layers[3]-1].conv3.out_channels]
 
-        self.fpn = PyramidFeatures(fpn_sizes[0], fpn_sizes[1], fpn_sizes[2],feature_size = 512)
+        #self.fpn = PyramidFeatures(fpn_sizes[0], fpn_sizes[1], fpn_sizes[2],feature_size = 512)
         self.rpn = RegionProposalNetwork(in_channels=512,mid_channels=512,feat_stride = self.feat_stride)
         self.roi_head = RoIHead(n_class = num_classes+1,roi_size=7,spatial_scale=(1. / self.feat_stride),
                                 in_channels=512,fc_features = 1024, n_relations= 0)
@@ -128,6 +128,7 @@ class ResNet(nn.Module):
         else:
             img_batch = inputs
 
+        scale = 1.
         _, _, H, W = img_batch.shape
         img_size = (H, W)
         x = self.conv1(img_batch)
@@ -138,8 +139,9 @@ class ResNet(nn.Module):
         x2 = self.layer2(x1)
         x3 = self.layer3(x2)
         x4 = self.layer4(x3)
-        features = self.fpn([x2, x3, x4])
 
+        #features = self.fpn([x2, x3, x4])
+        features = x4
         rpn_locs, rpn_scores, rois, roi_indices, anchor = self.rpn(features,img_size,scale)
 
         if self.training:

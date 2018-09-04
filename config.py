@@ -1,8 +1,8 @@
 
 class Config:
     # data
-    voc_data_dir = '/media/heecheol/새 볼륨/DataSet/VOC2012/'
-    min_size = 608  # image resize
+    voc_data_dir = '/media/heecheol/새 볼륨/DataSet/VOC2007/'
+    min_size = 604  # image resize
     max_size = 1024 # image resize
     num_workers = 16
 

@@ -57,12 +57,10 @@ def loc2bbox(src_bbox, loc):
     src_width = src_bbox[:, 3] - src_bbox[:, 1]
     src_ctr_y = src_bbox[:, 0] + 0.5 * src_height
     src_ctr_x = src_bbox[:, 1] + 0.5 * src_width
-
     dy = loc[:, 0::4]
     dx = loc[:, 1::4]
     dh = loc[:, 2::4]
     dw = loc[:, 3::4]
-
     ctr_y = dy * src_height[:, xp.newaxis] + src_ctr_y[:, xp.newaxis]
     ctr_x = dx * src_width[:, xp.newaxis] + src_ctr_x[:, xp.newaxis]
     h = xp.exp(dh) * src_height[:, xp.newaxis]
