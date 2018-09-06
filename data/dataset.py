@@ -7,21 +7,6 @@ import numpy as np
 
 
 
-def inverse_normalize(img):
-    # approximate un-normalize for visualize
-    return (img * 0.225 + 0.45).clip(min=0, max=1) * 255
-
-def normalize(img):
-    """
-    https://github.com/pytorch/vision/issues/223
-    return appr -1~1 RGB
-    """
-    normalize = tvtsf.Normalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225])
-    img = normalize(t.from_numpy(img))
-
-    return img.numpy()
-
 def preprocess(img, min_size=600, max_size=1000):
     """Preprocess an image for feature extraction.
 
@@ -46,12 +31,12 @@ def preprocess(img, min_size=600, max_size=1000):
     scale1 = min_size / min(H, W)
     scale2 = max_size / max(H, W)
     scale = min(scale1, scale2)
-    img = img / 255.
+    img = img.astype(np.float32)/255.0
     img = sktsf.resize(img, (C, (H * scale)//32 * 32, (W * scale)//32 * 32), mode='reflect')
     # both the longer and shorter should be less than
     # max_size and min_size
 
-    return normalize(img)
+    return img
 
 class Transform(object):
 
@@ -64,7 +49,7 @@ class Transform(object):
         _, H, W = img.shape
         img = preprocess(img, self.min_size, self.max_size)
         _, o_H, o_W = img.shape
-        scale = o_H / H
+
         bbox = util.resize_bbox(bbox, (H, W), (o_H, o_W))
 
         # horizontally flip
@@ -73,7 +58,7 @@ class Transform(object):
         bbox = util.flip_bbox(
             bbox, (o_H, o_W), x_flip=params['x_flip'])
 
-        return img, bbox, label, scale
+        return img, bbox, label, 1.0
 
 
 class Dataset:
@@ -98,7 +83,7 @@ class TestDataset:
     def __init__(self, opt, split='test', use_difficult=True):
         self.opt = opt
         self.db = VOCBboxDataset(opt.voc_data_dir, split=split, use_difficult=use_difficult)
-        self.Transform = Transform(800, 800)
+        self.Transform = Transform(604, 604)
     def __getitem__(self, idx):
         ori_img, bbox, label, difficult = self.db.get_example(idx)
         img, bbox, label, scale = self.Transform((ori_img, bbox, label))

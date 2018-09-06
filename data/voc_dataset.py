@@ -2,6 +2,10 @@ import os
 import xml.etree.ElementTree as ET
 
 import numpy as np
+import skimage.io
+import skimage.transform
+import skimage.color
+import skimage
 
 from .util import read_image
 
@@ -125,7 +129,12 @@ class VOCBboxDataset:
 
         # Load a image
         img_file = os.path.join(self.data_dir, 'JPEGImages', id_ + '.jpg')
-        img = read_image(img_file, color=True)
+        img = skimage.io.imread(img_file)
+        if len(img.shape) == 2:
+            img = skimage.color.gray2rgb(img)
+        img = img.transpose((2, 0, 1))
+
+        #img = read_image(img_file, color=True)
 
         # if self.return_difficult:
         #     return img, bbox, label, difficult

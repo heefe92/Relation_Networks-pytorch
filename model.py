@@ -18,7 +18,7 @@ from torch.autograd import Function
 
 from lib.roi_cupy import kernel_backward, kernel_forward
 from lib.creator_tool import ProposalCreator, ProposalTargetCreator, AnchorTargetCreator
-
+from lib.relation_tool import PositionalEmbedding
 Stream = namedtuple('Stream', ['ptr'])
 
 
@@ -76,7 +76,8 @@ class ResNet(nn.Module):
         self.rpn = RegionProposalNetwork(in_channels=512,mid_channels=512,feat_stride = self.feat_stride)
         self.roi_head = RoIHead(n_class = num_classes+1,roi_size=7,spatial_scale=(1. / self.feat_stride),
                                 in_channels=512,fc_features = 1024, n_relations= 0)
-
+        #self.duplicate_remover = DuplicationRemovalNetwork(n_relations=8,appearance_feature_dim=1024,
+        #                                                   key_feature_dim=128,geo_feature_dim=128)
         self.proposal_target_creator = ProposalTargetCreator()
         self.anchor_target_creator = AnchorTargetCreator()
 
@@ -156,11 +157,14 @@ class ResNet(nn.Module):
                 self.loc_normalize_mean,
                 self.loc_normalize_std)
             sample_roi_index = t.zeros(len(sample_roi))
-            roi_cls_loc, roi_score = self.roi_head(features, sample_roi, sample_roi_index)
+
+            roi_cls_loc, roi_score, appearance_features = self.roi_head(features, sample_roi, sample_roi_index)
+            #new_roi_socre,result_roi = self.duplicate_remover(sample_roi,roi_cls_loc, roi_score, appearance_features)
 
             return self.Loss(gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores)
         else:
-            roi_cls_loc, roi_score = self.roi_head(features, rois, roi_indices)
+            roi_cls_loc, roi_score, appearance_features = self.roi_head(features, rois, roi_indices)
+
             return roi_cls_loc,roi_score, rois, roi_indices
 
     def _suppress(self, raw_cls_bbox, raw_prob):
@@ -621,7 +625,12 @@ class RoIPooling2D(nn.Module):
         return self.RoI(x, rois)
 
 class DuplicationRemovalNetwork(nn.Module):
-    pass
+    def __init__(self,n_relations = 1, appearance_feature_dim=1024,key_feature_dim = 128, geo_feature_dim = 128):
+        super(RelationModule, self).__init__()
+    def foward(self,sample_roi,roi_cls_loc, roi_score, appearance_features):
+        pass
+
+
 class RelationModule(nn.Module):
     def __init__(self,n_relations = 16, appearance_feature_dim=1024,key_feature_dim = 64, geo_feature_dim = 64):
         super(RelationModule, self).__init__()
@@ -747,7 +756,7 @@ class RoIHead(nn.Module):
         xy_indices_and_rois = indices_and_rois[:, [0, 2, 1, 4, 3]]
         indices_and_rois = t.autograd.Variable(xy_indices_and_rois.contiguous())
         if(self.n_relations>0):
-            position_embedding = self.embedding(indices_and_rois,dim_g = self.dim_g)
+            position_embedding = PositionalEmbedding(indices_and_rois,dim_g = self.dim_g)
 
         pool = self.roi(x, indices_and_rois)
 
@@ -765,52 +774,8 @@ class RoIHead(nn.Module):
 
         roi_cls_locs = self.cls_loc(fc2)
         roi_scores = self.score(fc2)
-        return roi_cls_locs, roi_scores
-    def embedding(self,f_g, wave_len=1000, dim_g=64):
-        f_g = f_g[:,1:]
-        x_min,y_min,x_max,y_max = torch.chunk(f_g, 4, dim=1)
+        return roi_cls_locs, roi_scores, fc2
 
-        cx = (x_min + x_max)* 0.5
-        cy = (y_min + y_max) * 0.5
-        w = (x_max - x_min) + 1.
-        h = (y_max - y_min) + 1.
-
-        delta_x = cx - cx.view(1, -1)
-        delta_x = torch.clamp(torch.abs(delta_x / w), min = 1e-3)
-        delta_x = torch.log(delta_x)
-
-        delta_y = cy - cy.view(1, -1)
-        delta_y = torch.clamp(torch.abs(delta_y / h), min = 1e-3)
-        delta_y = torch.log(delta_y)
-
-        delta_w = torch.log(w / w.view(1,-1))
-        delta_h = torch.log(h / h.view(1, -1))
-        size = delta_h.size()
-
-        delta_x = delta_x.view(size[0],size[1],1)
-        delta_y = delta_y.view(size[0],size[1],1)
-        delta_w = delta_w.view(size[0],size[1],1)
-        delta_h = delta_h.view(size[0],size[1],1)
-
-        position_mat = torch.cat((delta_x,delta_y,delta_w,delta_h),-1)
-
-        feat_range = torch.arange(dim_g/8).cuda()
-        dim_mat = feat_range/ (dim_g/8)
-        dim_mat = 1. / (torch.pow(wave_len,dim_mat))
-
-
-
-        dim_mat = dim_mat.view(1,1,1,-1)
-        position_mat = position_mat.view(size[0],size[1],4,-1)
-        position_mat = 100. * position_mat
-
-        mul_mat = position_mat * dim_mat
-        mul_mat = mul_mat.view(size[0],size[1],-1)
-        sin_mat = torch.sin(mul_mat)
-        cos_mat = torch.cos(mul_mat)
-        embedding = torch.cat((sin_mat,cos_mat),-1)
-
-        return embedding
 def resnet18(num_classes, pretrained=False, **kwargs):
     """Constructs a ResNet-18 model.
     Args:
