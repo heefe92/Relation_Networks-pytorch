@@ -4,6 +4,7 @@ import numpy as np
 from torch.utils import data as data_
 import model
 
+from trainer import Trainer
 import torch
 import torch.optim as optim
 from lib.eval_tool import eval_detection_voc
@@ -52,83 +53,67 @@ def run_train():
     resnet = model.resnet18(20,True)
     resnet = resnet.cuda()
     resnet = torch.nn.DataParallel(resnet).cuda()
-
-    resnet.load_state_dict(torch.load('Weights/resnet18_Norelation_1.pt'))
-
-    # ## resnet params freeze
-    # child_count=0
-    # for child in resnet.module.children():
-    #     if(child_count<8):
-    #         for param in child.parameters():
-    #             param.requires_grad = False
-    #     else:
-    #         for param in child.parameters():
-    #             param.requires_grad = True
-    #     child_count+=1
-
-
     optimizer = optim.Adam(resnet.parameters(), lr=opt.lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
 
     loss_hist = collections.deque(maxlen=500)
-
-    resnet.train()
-    resnet.module.use_preset(isTraining=True)
-    resnet.module.freeze_bn()
-
     epoch_loss_hist = []
+
+    resnet_trainer = Trainer(resnet,optimizer,model_name='resnet18_no_relation')
+
+    freeze_num=8
+    best_loss = 10
+    best_loss_epoch_num = 0
+    num_bad_epochs = 0
+
     for epoch_num in range(opt.epoch):
-        start= time.time()
-        resnet.train()
-        resnet.module.use_preset(isTraining=True)
-        resnet.module.freeze_bn()
-        epoch_loss = []
+        if(freeze_num-epoch_num>=0):
+            resnet_trainer.model_freeze(freeze_num=freeze_num-epoch_num)
+        train_start_time = time.time()
+
+        train_epoch_loss = []
         for iter_num, data in enumerate(dataloader):
-            optimizer.zero_grad()
-            losses = resnet([data[0].cuda().float(),data[1].cuda().float(),data[2].cuda().float(),data[3].cuda().float()])
-            losses[4].backward()
-            torch.nn.utils.clip_grad_norm_(resnet.parameters(), 0.1)
+            curr_loss = resnet_trainer.train_step(data)
 
-            optimizer.step()
-
-            curr_loss=losses[4].item()
             loss_hist.append(float(curr_loss))
+            train_epoch_loss.append(float(curr_loss))
 
-            epoch_loss.append(float(curr_loss))
-
-            if(iter_num % 12000==11999):
-                print('Epoch: {} | Iteration: {} | loss: {:1.5f} | Running loss: {:1.5f}'.format(
-                        epoch_num, iter_num, float(curr_loss), np.mean(loss_hist)))
+            # if(iter_num % 12000==11999):
+            #     print('Epoch: {} | Iteration: {} | loss: {:1.5f} | Running loss: {:1.5f}'.format(
+            #             epoch_num, iter_num, float(curr_loss), np.mean(loss_hist)))
 
             del curr_loss
-        print('epoch time :',time.time()-start)
+        print('train epoch time :',time.time()-train_start_time)
         print('Epoch: {} | epoch train loss: {:1.5f}'.format(
-            epoch_num, np.mean(epoch_loss)))
+            epoch_num, np.mean(train_epoch_loss)))
 
-        test_epoch_loss=[]
+        vali_start_time = time.time()
+        vali_epoch_loss=[]
         for iter_num, data in enumerate(test_dataloader):
-            losses = resnet([data[0].cuda().float(),data[2].cuda().float(),data[3].cuda().float(),1.0])
-            curr_loss = losses[4].item()
-
-            test_epoch_loss.append(float(curr_loss))
+            curr_loss = resnet_trainer.get_loss(data)
+            vali_epoch_loss.append(float(curr_loss))
 
             del curr_loss
 
-        scheduler.step(np.mean(test_epoch_loss))
-        epoch_loss_hist.append(np.mean(test_epoch_loss))
+        epoch_loss_hist.append(np.mean(vali_epoch_loss))
 
-        print('test epoch time :',time.time()-start)
-        print('Epoch: {} | epoch test loss: {:1.5f}'.format(
-            epoch_num, np.mean(test_epoch_loss)))
-        # if(epoch_num%1 == 0):
-        #     resnet.eval()
-        #     if(epoch_num<15):
-        #         eval_result = eval(test_dataloader, resnet, test_num=1000)
-        #     else :
-        #         eval_result = eval(test_dataloader, resnet, test_num=10000)
-        #     print(epoch_num,'_eval_result : ', eval_result)
-        #     torch.save(resnet.state_dict(), 'Weights/resnet18_Norelation_{}.pt'.format(epoch_num))
-    #print(epoch_loss_hist)
+        print('vali epoch time :',time.time()-vali_start_time)
+        print('Epoch: {} | epoch vali loss: {:1.5f}'.format(
+            epoch_num, np.mean(vali_epoch_loss)))
+        print('----------------------------------------')
+
+        if(np.mean(vali_epoch_loss) > best_loss):
+            num_bad_epochs += 1
+        else:
+            best_loss=np.mean(vali_epoch_loss)
+            best_loss_epoch_num=epoch_num
+        if(num_bad_epochs>2):
+            num_bad_epochs=0
+            resnet_trainer.model_load(best_loss_epoch_num)
+            resnet_trainer.reduce_lr(factor=0.1,verbose=True)
+        else:
+            resnet_trainer.model_save(epoch_num)
+
+    print(epoch_loss_hist)
 
 if __name__=="__main__":
     run_train()
