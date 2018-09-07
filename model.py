@@ -628,6 +628,7 @@ class DuplicationRemovalNetwork(nn.Module):
     def __init__(self,n_relations = 1, appearance_feature_dim=1024,key_feature_dim = 128, geo_feature_dim = 128):
         super(RelationModule, self).__init__()
     def foward(self,sample_roi,roi_cls_loc, roi_score, appearance_features):
+
         pass
 
 

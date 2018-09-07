@@ -34,7 +34,7 @@ def eval(dataloader, resnet, test_num=10000):
         use_07_metric=True)
     return result
 
-def run_train():
+def run_train(train_verbose=False):
     dataset = Dataset(opt)
     dataloader = data_.DataLoader(dataset, \
                                       batch_size=opt.batch_size, \
@@ -77,9 +77,9 @@ def run_train():
             loss_hist.append(float(curr_loss))
             train_epoch_loss.append(float(curr_loss))
 
-            # if(iter_num % 12000==11999):
-            #     print('Epoch: {} | Iteration: {} | loss: {:1.5f} | Running loss: {:1.5f}'.format(
-            #             epoch_num, iter_num, float(curr_loss), np.mean(loss_hist)))
+            if(train_verbose):
+                print('Epoch: {} | Iteration: {} | loss: {:1.5f} | Running loss: {:1.5f}'.format(
+                        epoch_num, iter_num, float(curr_loss), np.mean(loss_hist)))
 
             del curr_loss
         print('train epoch time :',time.time()-train_start_time)
@@ -106,6 +106,7 @@ def run_train():
         else:
             best_loss=np.mean(vali_epoch_loss)
             best_loss_epoch_num=epoch_num
+            num_bad_epochs = 0
         if(num_bad_epochs>2):
             num_bad_epochs=0
             resnet_trainer.model_load(best_loss_epoch_num)
