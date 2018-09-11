@@ -1,3 +1,4 @@
+import numpy as np
 
 from torch import nn
 import torch as t
@@ -5,7 +6,8 @@ from torch.autograd import Variable
 import lib.array_tool as at
 from torch.nn import functional as F
 from config import opt
-
+from lib.bbox_tools import bbox_iou
+from lib.array_tool import tonumpy
 def _smooth_l1_loss(x, t, in_weight, sigma):
     sigma2 = sigma ** 2
     diff = in_weight * (x - t)
@@ -79,3 +81,31 @@ class FasterRCNNLoss(nn.Module):
         losses = losses + [sum(losses)]
 
         return losses
+
+
+class RelationNetworksLoss(nn.Module):
+    def __init__(self):
+        super(RelationNetworksLoss, self).__init__()
+
+    def forward(self, gt_bboxes, gt_labels, nms_scores, sorted_labels, sorted_cls_bboxes):
+        sorted_score, prob_argsort = t.sort(nms_scores, descending=True)
+        sorted_cls_bboxes = sorted_cls_bboxes[prob_argsort]
+        sorted_labels = sorted_labels[prob_argsort]
+        sorted_labels = tonumpy(sorted_labels)
+        gt_labels = tonumpy(gt_labels)
+
+        nms_gt = t.zeros_like(sorted_score)
+
+        eps = 1e-8
+
+        iou = bbox_iou(tonumpy(gt_bboxes[0]), tonumpy(sorted_cls_bboxes))
+        for gt_idx in range(len(iou)):
+            accept_iou = np.reshape(np.argwhere(iou[gt_idx] > 0.5),-1)
+            accept_label = np.reshape(np.argwhere(sorted_labels[accept_iou] == gt_labels[0][gt_idx]),-1)
+
+            if not(len(accept_label)==0):
+                nms_gt[accept_iou[accept_label[0]]] = 1.
+
+        loss = (nms_gt -sorted_score) **2
+        loss = loss.sum()
+        return -loss
