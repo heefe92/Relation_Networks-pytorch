@@ -3,11 +3,11 @@ Relation Networks for object detection based pytorch
 
 ### Progress
 
-- [x] train and forward resnet based faster-rcnn on VOC2012
-- [x] add pyramid module
 - [x] add relation module
 - [x] add nms using relation module
-- [ ] train end to end faster-rcnn on VOC2012
+- [x] end to end train renet based faster-rcnn on VOC2007
+- [x] evaluate mAP
+- [ ] improve performance
 - [ ] train and forward on COCO
 
 
@@ -20,3 +20,4 @@ This work builds on many excellent works, which include:
 - [faster-rcnn.pytorch by Jianwei Yang and Jiasen Lu](https://github.com/jwyang/faster-rcnn.pytorch).It mainly refer to [longcw's faster_rcnn_pytorch](https://github.com/longcw/faster_rcnn_pytorch)
 - All the above Repositories have referred to [py-faster-rcnn by Ross Girshick and Sean Bell](https://github.com/rbgirshick/py-faster-rcnn)  either directly or indirectly. 
 - [yhenon's pytorch-retinanet](https://github.com/yhenon/pytorch-retinanet)
+- [msracver's Relation-Networks-for-Object-Detection](https://github.com/msracver/Relation-Networks-for-Object-Detection)
