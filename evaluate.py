@@ -51,7 +51,6 @@ def run_evaluate():
                                         )
 
     resnet = model.resnet101(20,True)
-    resnet = resnet.cuda()
     resnet = torch.nn.DataParallel(resnet).cuda()
 
     resnet.load_state_dict(torch.load('Weights/resnet101_pyramid_no_relation_e2e_12.pt'))

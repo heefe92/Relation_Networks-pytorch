@@ -28,7 +28,6 @@ def run_train(train_verbose=False):
                                        )
 
     resnet = model.resnet101(20,True)
-    resnet = resnet.cuda()
     resnet = torch.nn.DataParallel(resnet).cuda()
 
     optimizer = optim.Adam(resnet.parameters(), lr=opt.lr)

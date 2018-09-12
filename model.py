@@ -72,13 +72,13 @@ class ResNet(nn.Module):
         elif block == Bottleneck:
             fpn_sizes = [self.layer2[layers[1]-1].conv3.out_channels, self.layer3[layers[2]-1].conv3.out_channels,
                          self.layer4[layers[3]-1].conv3.out_channels]
-            self.conv2 = nn.Conv2d(self.layer4[layers[3]-1].conv2.out_channels, 512, kernel_size=1, stride=1, bias=False)
+            self.conv2 = nn.Conv2d(self.layer4[layers[3]-1].conv3.out_channels, 512, kernel_size=1, stride=1, bias=False)
 
         #self.fpn = PyramidFeatures(fpn_sizes[0], fpn_sizes[1], fpn_sizes[2],feature_size = 512)
 
         self.rpn = RegionProposalNetwork(in_channels=512,mid_channels=512,feat_stride = self.feat_stride)
         self.roi_head = RoIHead(n_class = num_classes+1,roi_size=7,spatial_scale=(1. / self.feat_stride),
-                                in_channels=512,fc_features = 1024, n_relations= 0)
+                                in_channels=512,fc_features = 1024, n_relations= 16)
         self.duplicate_remover = DuplicationRemovalNetwork(n_relations=8,appearance_feature_dim=1024,
                                                            key_feature_dim=128,geo_feature_dim=128,
                                                            num_classes=num_classes)
