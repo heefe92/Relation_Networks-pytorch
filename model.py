@@ -68,11 +68,14 @@ class ResNet(nn.Module):
         if block == BasicBlock:
             fpn_sizes = [self.layer2[layers[1]-1].conv2.out_channels, self.layer3[layers[2]-1].conv2.out_channels,
                          self.layer4[layers[3]-1].conv2.out_channels]
+            self.conv2 = nn.Conv2d(self.layer4[layers[3]-1].conv2.out_channels, 512, kernel_size=1, stride=1, bias=False)
         elif block == Bottleneck:
             fpn_sizes = [self.layer2[layers[1]-1].conv3.out_channels, self.layer3[layers[2]-1].conv3.out_channels,
                          self.layer4[layers[3]-1].conv3.out_channels]
+            self.conv2 = nn.Conv2d(self.layer4[layers[3]-1].conv2.out_channels, 512, kernel_size=1, stride=1, bias=False)
 
-        self.fpn = PyramidFeatures(fpn_sizes[0], fpn_sizes[1], fpn_sizes[2],feature_size = 512)
+        #self.fpn = PyramidFeatures(fpn_sizes[0], fpn_sizes[1], fpn_sizes[2],feature_size = 512)
+
         self.rpn = RegionProposalNetwork(in_channels=512,mid_channels=512,feat_stride = self.feat_stride)
         self.roi_head = RoIHead(n_class = num_classes+1,roi_size=7,spatial_scale=(1. / self.feat_stride),
                                 in_channels=512,fc_features = 1024, n_relations= 0)
@@ -125,12 +128,11 @@ class ResNet(nn.Module):
 
     def forward(self, inputs, scale=1.):
         if self.training:
-            img_batch, bboxes, labels, scale = inputs
+            img_batch, bboxes, labels, _ = inputs
 
         else:
             img_batch = inputs
 
-        scale = 1.
         _, _, H, W = img_batch.shape
         img_size = (H, W)
         x = self.conv1(img_batch)
@@ -142,8 +144,8 @@ class ResNet(nn.Module):
         x3 = self.layer3(x2)
         x4 = self.layer4(x3)
 
-        features = self.fpn([x2, x3, x4])
-        #features = x4
+        #features = self.fpn([x2, x3, x4])
+        features = self.conv2(x4)
         rpn_locs, rpn_scores, rois, roi_indices, anchor = self.rpn(features,img_size,scale)
 
         if self.training:
@@ -174,87 +176,7 @@ class ResNet(nn.Module):
             return nms_scores, sorted_labels, sorted_cls_bboxes
             #return roi_cls_loc,roi_score, rois, roi_indices
 
-    def _suppress(self, raw_cls_bbox, raw_prob):
-        bbox = list()
-        label = list()
-        score = list()
-        # skip cls_id = 0 because it is the background class
-        for l in range(1, self.n_class):
-            cls_bbox_l = raw_cls_bbox.reshape((-1, self.n_class, 4))[:, l, :]
-            prob_l = raw_prob[:, l]
-            mask = prob_l > self.score_thresh
-            cls_bbox_l = cls_bbox_l[mask]
-            prob_l = prob_l[mask]
-            keep = non_maximum_suppression(
-                cp.array(cls_bbox_l), self.nms_thresh, prob_l)
-            keep = cp.asnumpy(keep)
-            bbox.append(cls_bbox_l[keep])
-            # The labels are in [0, self.n_class - 2].
-            label.append((l - 1) * np.ones((len(keep),)))
-            score.append(prob_l[keep])
-        bbox = np.concatenate(bbox, axis=0).astype(np.float32)
-        label = np.concatenate(label, axis=0).astype(np.int32)
-        score = np.concatenate(score, axis=0).astype(np.float32)
-        return bbox, label, score
-    def predict(self,imgs,sizes=None,visualize=False):
-        if visualize:
-            self.use_preset(isTraining=False,preset='visualize')
-            prepared_imgs = list()
-            sizes = list()
-            for img in imgs:
-                size = img.shape[1:]
-                img = preprocess(at.tonumpy(img))
-                prepared_imgs.append(img)
-                sizes.append(size)
-        else:
-            self.use_preset(isTraining=False,preset='evaluate')
-            prepared_imgs = imgs
-        bboxes = list()
-        labels = list()
-        scores = list()
-        for img, size in zip(prepared_imgs, sizes):
-            img = t.autograd.Variable(at.totensor(img).float()[None], volatile=True)
-            scale = img.shape[3] / size[1]
-            roi_cls_loc, roi_scores, rois, _ = self(img, scale=scale)
-            # We are assuming that batch size is 1.
-            roi_score = roi_scores.data
-            roi_cls_loc = roi_cls_loc.data
-            if visualize:
-                roi = at.totensor(rois) / scale
-            else:
-                roi = at.totensor(rois) / scale.cuda().float()
 
-            # Convert predictions to bounding boxes in image coordinates.
-            # Bounding boxes are scaled to the scale of the input images.
-            mean = t.Tensor(self.loc_normalize_mean).cuda(). \
-                repeat(self.n_class)[None]
-            std = t.Tensor(self.loc_normalize_std).cuda(). \
-                repeat(self.n_class)[None]
-
-            roi_cls_loc = (roi_cls_loc * std + mean)
-            roi_cls_loc = roi_cls_loc.view(-1, self.n_class, 4)
-            roi = roi.view(-1, 1, 4).expand_as(roi_cls_loc)
-            cls_bbox = loc2bbox(at.tonumpy(roi).reshape((-1, 4)),
-                                at.tonumpy(roi_cls_loc).reshape((-1, 4)))
-            cls_bbox = at.totensor(cls_bbox)
-            cls_bbox = cls_bbox.view(-1, self.n_class * 4)
-            # clip bounding box
-            cls_bbox[:, 0::2] = (cls_bbox[:, 0::2]).clamp(min=0, max=size[0])
-            cls_bbox[:, 1::2] = (cls_bbox[:, 1::2]).clamp(min=0, max=size[1])
-
-            prob = at.tonumpy(F.softmax(at.tovariable(roi_score), dim=1))
-
-            raw_cls_bbox = at.tonumpy(cls_bbox)
-            raw_prob = at.tonumpy(prob)
-
-            bbox, label, score = self._suppress(raw_cls_bbox, raw_prob)
-            bboxes.append(bbox)
-            labels.append(label)
-            scores.append(score)
-
-        # self.use_preset('evaluate')
-        # self.train()
-        return bboxes, labels, scores
 class RegionProposalNetwork(nn.Module):
     """Region Proposal Network introduced in Faster R-CNN.
 

@@ -7,7 +7,6 @@ import model
 from trainer import Trainer
 import torch
 import torch.optim as optim
-from lib.eval_tool import eval_detection_voc
 from data.dataset import Dataset, TestDataset
 from config import opt
 import cv2,time
@@ -36,7 +35,7 @@ def run_train(train_verbose=False):
 
     loss_hist = collections.deque(maxlen=500)
     epoch_loss_hist = []
-    resnet_trainer = Trainer(resnet,optimizer,model_name='resnet101_pyramid_no_relation_e2e')
+    resnet_trainer = Trainer(resnet,optimizer,model_name=opt.model_name)
 
     freeze_num = 8
     best_loss = 10

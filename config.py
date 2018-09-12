@@ -21,5 +21,7 @@ class Config:
     batch_size=1
 
 
+    model_name='resnet101_no_relation_e2e'
+
 
 opt = Config()
