@@ -99,4 +99,4 @@ def run_train(train_verbose=False):
 
 
 if __name__ == "__main__":
-    run_train(train_verbose = True)
+    run_train(train_verbose = False)

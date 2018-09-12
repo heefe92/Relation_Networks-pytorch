@@ -108,4 +108,4 @@ class RelationNetworksLoss(nn.Module):
 
         loss = (nms_gt -sorted_score) **2
         loss = loss.sum()
-        return -loss
+        return loss
