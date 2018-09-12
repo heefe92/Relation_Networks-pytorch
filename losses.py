@@ -106,6 +106,6 @@ class RelationNetworksLoss(nn.Module):
             if not(len(accept_label)==0):
                 nms_gt[accept_iou[accept_label[0]]] = 1.
 
-        loss = (nms_gt -sorted_score) **2
-        loss = loss.sum()
+        loss = nms_gt * (sorted_score+ eps).log() + (1 - nms_gt) * (1-sorted_score + eps).log()
+        loss = -loss.mean()
         return loss
