@@ -14,3 +14,15 @@ resnet101_pyramid_no_relation_e2e
 Epoch: 14 | epoch train loss: 3.83095
 Epoch: 14 | epoch vali loss: 3.70913
 best epoch num 14
+
+---------------------------------------------
+resnet101_pyramid_no_relation_e2e
+Epoch: 6 | epoch train loss: 0.49311
+Epoch: 6 | epoch vali loss: 0.98503
+best epoch num 6
+
+--------------------------------------------
+resnet101_pyramid_no_relation_e2e
+Epoch: 7 | epoch train loss: 0.52024
+Epoch: 7 | epoch vali loss: 0.94327
+best epoch num 7

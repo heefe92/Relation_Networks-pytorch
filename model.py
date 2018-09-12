@@ -172,7 +172,7 @@ class ResNet(nn.Module):
             nms_scores, sorted_labels, sorted_cls_bboxes = self.duplicate_remover(rois, roi_cls_loc, roi_score,
                                                                                   appearance_features, img_size)
             return nms_scores, sorted_labels, sorted_cls_bboxes
-            return roi_cls_loc,roi_score, rois, roi_indices
+            #return roi_cls_loc,roi_score, rois, roi_indices
 
     def _suppress(self, raw_cls_bbox, raw_prob):
         bbox = list()

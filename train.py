@@ -45,11 +45,8 @@ def run_train(train_verbose=False):
     max_bad_epochs = 5
     resnet_trainer.model_freeze(freeze_num=freeze_num)
 
-
     for epoch_num in range(opt.epoch):
-
         train_start_time = time.time()
-
         train_epoch_loss = []
         for iter_num, data in enumerate(dataloader):
             curr_loss = resnet_trainer.train_step(data)
