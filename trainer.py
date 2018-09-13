@@ -1,4 +1,5 @@
 import torch
+from evaluate import eval
 
 class Trainer():
     def __init__(self, my_model, optimizer, model_name):
@@ -9,6 +10,17 @@ class Trainer():
         self.my_model.module.use_preset(isTraining=True)
         self.my_model.module.freeze_bn()
 
+    def train_mode(self,freeze_num):
+        self.my_model.module.use_preset(isTraining=True)
+        self.my_model.module.freeze_bn()
+        self.model_freeze(freeze_num)
+
+    def eval_mode(self):
+        self.my_model.module.use_preset(isTraining=False, preset='evaluate')
+        self.my_model.eval()
+        for child in self.my_model.module.children():
+            for param in child.parameters():
+                param.requires_grad = False
     def train_step(self, data):
         self.optimizer.zero_grad()
         losses = self.my_model(
@@ -51,3 +63,7 @@ class Trainer():
                 for param in child.parameters():
                     param.requires_grad = True
             child_count+=1
+        self.my_model.module.freeze_bn()
+    def run_eval(self, data_loader,test_num=1000000):
+
+        return eval(data_loader, self.my_model, test_num)

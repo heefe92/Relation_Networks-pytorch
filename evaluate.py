@@ -53,7 +53,7 @@ def run_evaluate():
     resnet = model.resnet101(20,True)
     resnet = torch.nn.DataParallel(resnet).cuda()
 
-    resnet.load_state_dict(torch.load('Weights/resnet101_pyramid_no_relation_e2e_12.pt'))
+    resnet.load_state_dict(torch.load('Weights/resnet101_relation_e2e_20.pt'))
     resnet.module.use_preset(isTraining=False,preset='evaluate')
     resnet.eval()
 
@@ -61,7 +61,7 @@ def run_evaluate():
         for param in child.parameters():
             param.requires_grad = False
 
-    print(eval(test_dataloader,resnet,10000))
+    print(eval(test_dataloader,resnet,100))
 
 if __name__ == "__main__":
     run_evaluate()

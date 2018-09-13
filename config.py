@@ -20,8 +20,10 @@ class Config:
     #The batch size can still only one.
     batch_size=1
 
-
     model_name='resnet101_relation_e2e'
+
+    features_dim = 512
+
 
 
 opt = Config()

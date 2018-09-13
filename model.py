@@ -78,9 +78,8 @@ class ResNet(nn.Module):
 
         self.rpn = RegionProposalNetwork(in_channels=512,mid_channels=512,feat_stride = self.feat_stride)
         self.roi_head = RoIHead(n_class = num_classes+1,roi_size=7,spatial_scale=(1. / self.feat_stride),
-                                in_channels=512,fc_features = 1024, n_relations= 16)
+                                in_channels=512,fc_features = 1024, n_relations= 8)
         self.duplicate_remover = DuplicationRemovalNetwork(n_relations=8,appearance_feature_dim=1024,
-                                                           key_feature_dim=128,geo_feature_dim=128,
                                                            num_classes=num_classes)
         self.proposal_target_creator = ProposalTargetCreator()
         self.anchor_target_creator = AnchorTargetCreator()
@@ -554,17 +553,20 @@ class RoIPooling2D(nn.Module):
         return self.RoI(x, rois)
 
 class DuplicationRemovalNetwork(nn.Module):
-    def __init__(self,n_relations = 1, appearance_feature_dim=1024,key_feature_dim = 128, geo_feature_dim = 128,num_classes=20):
+    def __init__(self,n_relations = 16, appearance_feature_dim=1024,num_classes=20):
         super(DuplicationRemovalNetwork, self).__init__()
         self.loc_normalize_mean = (0., 0., 0., 0.)
         self.loc_normalize_std = (0.1, 0.1, 0.2, 0.2)
-        self.key_feature_dim = key_feature_dim
+        self.key_feature_dim = int(appearance_feature_dim/n_relations)
+        self.geo_feature_dim = int(appearance_feature_dim/n_relations)
         self.appearance_feature_dim=appearance_feature_dim
         self.n_class = num_classes+1
 
         self.nms_rank_fc = nn.Linear(appearance_feature_dim, appearance_feature_dim, bias=True)
         self.roi_feat_embedding_fc = nn.Linear(appearance_feature_dim,appearance_feature_dim,bias=True)
-        self.relation_module = RelationModule(n_relations=16,appearance_feature_dim=1024)
+        self.relation_module = RelationModule(n_relations=n_relations,appearance_feature_dim=appearance_feature_dim,
+                                              key_feature_dim=int(appearance_feature_dim/n_relations),
+                                              geo_feature_dim=int(appearance_feature_dim/n_relations))
 
         self.nms_logit_fc = nn.Linear(appearance_feature_dim,1,bias=True)
         self.sigmoid = nn.Sigmoid()
@@ -617,7 +619,7 @@ class DuplicationRemovalNetwork(nn.Module):
             nms_rank = self.nms_rank_fc(nms_rank_embedding)
             roi_feat_embedding = self.roi_feat_embedding_fc(sorted_features)
             nms_embedding_feat = nms_rank + roi_feat_embedding
-            position_embedding=PositionalEmbedding(sorted_cls_bboxes)
+            position_embedding = PositionalEmbedding(sorted_cls_bboxes,dim_g = self.geo_feature_dim)
             nms_logit = self.relation_module(nms_embedding_feat,position_embedding)
             nms_logit = self.nms_logit_fc(nms_logit)
             s1 = self.sigmoid(nms_logit).view(-1)
@@ -660,7 +662,6 @@ class RelationUnit(nn.Module):
         position_embedding = position_embedding.view(-1,self.dim_g)
 
         w_g = self.relu(self.WG(position_embedding))
-
         w_k = self.WK(f_a)
         w_k = w_k.view(N,1,self.dim_k)
 
