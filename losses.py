@@ -30,14 +30,12 @@ def _fast_rcnn_loc_loss(pred_loc, gt_loc, gt_label, sigma):
     loc_loss /= (gt_label >= 0).sum().float()  # ignore gt_label==-1 for rpn_loss
     return loc_loss
 
-
-class FasterRCNNLoss(nn.Module):
+class RPNLoss(nn.Module):
     def __init__(self):
-        super(FasterRCNNLoss, self).__init__()
+        super(RPNLoss, self).__init__()
         self.rpn_sigma = opt.rpn_sigma
-        self.roi_sigma = opt.roi_sigma
 
-    def forward(self, gt_rpn_loc,gt_rpn_label, gt_roi_loc, gt_roi_label,roi_cls_loc, roi_score,rpn_locs, rpn_scores):
+    def forward(self, gt_rpn_loc,gt_rpn_label,  rpn_locs, rpn_scores):
         # Since batch size is one, convert variables to singular form
         rpn_score = rpn_scores[0]
         rpn_loc = rpn_locs[0]
@@ -55,12 +53,13 @@ class FasterRCNNLoss(nn.Module):
 
         # NOTE: default value of ignore_index is -100 ...
         rpn_cls_loss = F.cross_entropy(rpn_score, gt_rpn_label.cuda(), ignore_index=-1)
-        # _gt_rpn_label = gt_rpn_label[gt_rpn_label > -1]
-        # _rpn_score = at.tonumpy(rpn_score)[at.tonumpy(gt_rpn_label) > -1]
-        # self.rpn_cm.add(at.totensor(_rpn_score, False), _gt_rpn_label.data.long())
+        return [rpn_loc_loss, rpn_cls_loss]
 
-
-        # ------------------ ROI losses (fast rcnn loss) -------------------#
+class ROILoss(nn.Module):
+    def __init__(self):
+        super(ROILoss, self).__init__()
+        self.roi_sigma = opt.roi_sigma
+    def forward(self,gt_roi_loc, gt_roi_label,roi_cls_loc, roi_score):
         n_sample = roi_cls_loc.shape[0]
         roi_cls_loc = roi_cls_loc.view(n_sample, -1, 4)
         gt_roi_label = at.tovariable(gt_roi_label).long()
@@ -74,20 +73,15 @@ class FasterRCNNLoss(nn.Module):
             self.roi_sigma)
 
         roi_cls_loss = nn.CrossEntropyLoss()(roi_score, gt_roi_label.cuda())
-
-        # self.roi_cm.add(at.totensor(roi_scores, False), gt_roi_label.data.long())
-
-        losses = [rpn_loc_loss, rpn_cls_loss, roi_loc_loss, roi_cls_loss]
-        losses = losses + [sum(losses)]
-
-        return losses
-
+        return [roi_loc_loss,roi_cls_loss]
 
 class RelationNetworksLoss(nn.Module):
     def __init__(self):
         super(RelationNetworksLoss, self).__init__()
 
     def forward(self, gt_bboxes, gt_labels, nms_scores, sorted_labels, sorted_cls_bboxes):
+        if nms_scores is None:
+            return [1.]
         sorted_score, prob_argsort = t.sort(nms_scores, descending=True)
         sorted_cls_bboxes = sorted_cls_bboxes[prob_argsort]
         sorted_labels = sorted_labels[prob_argsort]
@@ -108,4 +102,4 @@ class RelationNetworksLoss(nn.Module):
 
         loss = nms_gt * (sorted_score+ eps).log() + (1 - nms_gt) * (1-sorted_score + eps).log()
         loss = -loss.mean()
-        return loss
+        return [loss]

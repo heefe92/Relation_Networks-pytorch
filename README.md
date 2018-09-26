@@ -7,10 +7,22 @@ Relation Networks for object detection based pytorch
 - [x] add nms using relation module
 - [x] end to end train renet based faster-rcnn on VOC2007
 - [x] evaluate mAP
+- [ ] modified learn_nms
+- [ ] add OHEM
 - [ ] improve performance
 - [ ] train and forward on COCO
 
-
+## Requirements
+1. Python3.5
+2. The following Python packages:
+  ```
+  Cython
+  cupy
+  numpy
+  pytorch
+  opencv-python
+  collections
+  ```
 ## Acknowledgement
 This work builds on many excellent works, which include:
 

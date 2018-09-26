@@ -16,11 +16,11 @@ class Config:
 
     # training
     epoch = 100
-
+    isLearnNMS = False
     #The batch size can still only one.
     batch_size=1
 
-    model_name='resnet101_relation_e2e'
+    model_name='resnet101_relation'
 
     features_dim = 512
 

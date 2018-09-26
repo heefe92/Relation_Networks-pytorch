@@ -4,7 +4,7 @@ import torch.utils.model_zoo as model_zoo
 import six
 
 from torch.nn import functional as F
-from losses import FasterRCNNLoss, RelationNetworksLoss
+from losses import ROILoss, RPNLoss, RelationNetworksLoss
 from lib.nms import non_maximum_suppression
 from collections import namedtuple
 from string import Template
@@ -78,13 +78,14 @@ class ResNet(nn.Module):
 
         self.rpn = RegionProposalNetwork(in_channels=512,mid_channels=512,feat_stride = self.feat_stride)
         self.roi_head = RoIHead(n_class = num_classes+1,roi_size=7,spatial_scale=(1. / self.feat_stride),
-                                in_channels=512,fc_features = 1024, n_relations= 8)
-        self.duplicate_remover = DuplicationRemovalNetwork(n_relations=8,appearance_feature_dim=1024,
+                                in_channels=512,fc_features = 1024, n_relations= 16)
+        self.duplicate_remover = DuplicationRemovalNetwork(n_relations=16,appearance_feature_dim=1024,
                                                            num_classes=num_classes)
         self.proposal_target_creator = ProposalTargetCreator()
         self.anchor_target_creator = AnchorTargetCreator()
 
-        self.Loss = FasterRCNNLoss()
+        self.roiLoss = ROILoss()
+        self.rpnLoss = RPNLoss()
         self.nmsLoss = RelationNetworksLoss()
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -118,17 +119,14 @@ class ResNet(nn.Module):
         for i in range(1, blocks):
             layers.append(block(self.inplanes, planes))
         return nn.Sequential(*layers)
-
     def freeze_bn(self):
         '''Freeze BatchNorm layers.'''
         for layer in self.modules():
             if isinstance(layer, nn.BatchNorm2d):
                 layer.eval()
-
     def forward(self, inputs, scale=1.):
         if self.training:
             img_batch, bboxes, labels, _ = inputs
-
         else:
             img_batch = inputs
 
@@ -161,20 +159,130 @@ class ResNet(nn.Module):
             sample_roi_index = t.zeros(len(sample_roi))
 
             roi_cls_loc, roi_score, appearance_features = self.roi_head(features, sample_roi, sample_roi_index)
-            nms_scores, sorted_labels, sorted_cls_bboxes =self.duplicate_remover(sample_roi,roi_cls_loc, roi_score, appearance_features,img_size)
-            if(nms_scores is None):
-                return self.Loss(gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores)
-            else:
-                result_loss = self.Loss(gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores)
-                result_loss[4]+=self.nmsLoss(bboxes, labels,nms_scores, sorted_labels, sorted_cls_bboxes)
-                return result_loss
+
+            return gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores,\
+                   sample_roi, roi_cls_loc, roi_score, appearance_features, img_size,labels, bboxes
+
+            # nms_scores, sorted_labels, sorted_cls_bboxes =self.duplicate_remover(sample_roi,roi_cls_loc, roi_score, appearance_features,img_size)
+            # return self.Loss(gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs,
+            #                  rpn_scores)
+            # if(nms_scores is None):
+            #     return [0.,0.,0.,0.,0.]
+            #     return self.Loss(gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs,
+            #                       rpn_scores)
+            # else:
+            #     result_loss=[0.,0.,0.,0.,0.]
+            #     #result_loss = self.Loss(gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores)
+            #
+            #     result_loss[4]+=self.nmsLoss(bboxes, labels,nms_scores, sorted_labels, sorted_cls_bboxes)
+            #     return result_loss
         else:
             roi_cls_loc, roi_score, appearance_features = self.roi_head(features, rois, roi_indices)
-            nms_scores, sorted_labels, sorted_cls_bboxes = self.duplicate_remover(rois, roi_cls_loc, roi_score,
-                                                                                  appearance_features, img_size)
-            return nms_scores, sorted_labels, sorted_cls_bboxes
-            #return roi_cls_loc,roi_score, rois, roi_indices
+            # nms_scores, sorted_labels, sorted_cls_bboxes = self.duplicate_remover(rois, roi_cls_loc, roi_score,
+            #                                                                       appearance_features, img_size)
+            #return nms_scores, sorted_labels, sorted_cls_bboxes
+            return roi_cls_loc,roi_score, rois, roi_indices, appearance_features, img_size
 
+    def _suppress(self, raw_cls_bbox, raw_prob):
+        bbox = list()
+        label = list()
+        score = list()
+        # skip cls_id = 0 because it is the background class
+        for l in range(1, self.n_class):
+            cls_bbox_l = raw_cls_bbox.reshape((-1, self.n_class, 4))[:, l, :]
+            prob_l = raw_prob[:, l]
+            mask = prob_l > self.score_thresh
+            cls_bbox_l = cls_bbox_l[mask]
+            prob_l = prob_l[mask]
+            keep = non_maximum_suppression(
+                cp.array(cls_bbox_l), self.nms_thresh, prob_l)
+            keep = cp.asnumpy(keep)
+            bbox.append(cls_bbox_l[keep])
+            # The labels are in [0, self.n_class - 2].
+            label.append((l - 1) * np.ones((len(keep),)))
+            score.append(prob_l[keep])
+        bbox = np.concatenate(bbox, axis=0).astype(np.float32)
+        label = np.concatenate(label, axis=0).astype(np.int32)
+        score = np.concatenate(score, axis=0).astype(np.float32)
+        return bbox, label, score
+    def predict(self, imgs, sizes=None, visualize=False):
+        if visualize:
+            self.use_preset(isTraining=False, preset='visualize')
+            prepared_imgs = list()
+            sizes = list()
+            for img in imgs:
+                size = img.shape[1:]
+                img = preprocess(at.tonumpy(img))
+                prepared_imgs.append(img)
+                sizes.append(size)
+        else:
+            self.use_preset(isTraining=False, preset='evaluate')
+            prepared_imgs = imgs
+        bboxes = list()
+        labels = list()
+        scores = list()
+        for img, size in zip(prepared_imgs, sizes):
+            img = t.autograd.Variable(at.totensor(img).float()[None], volatile=True)
+            scale = img.shape[3] / size[1]
+            roi_cls_loc, roi_scores, rois, _ = self(img, scale=scale)
+            # We are assuming that batch size is 1.
+            roi_score = roi_scores.data
+            roi_cls_loc = roi_cls_loc.data
+            if visualize:
+                roi = at.totensor(rois) / scale
+            else:
+                roi = at.totensor(rois) / scale.cuda().float()
+
+            # Convert predictions to bounding boxes in image coordinates.
+            # Bounding boxes are scaled to the scale of the input images.
+            mean = t.Tensor(self.loc_normalize_mean).cuda(). \
+                repeat(self.n_class)[None]
+            std = t.Tensor(self.loc_normalize_std).cuda(). \
+                repeat(self.n_class)[None]
+
+            roi_cls_loc = (roi_cls_loc * std + mean)
+            roi_cls_loc = roi_cls_loc.view(-1, self.n_class, 4)
+            roi = roi.view(-1, 1, 4).expand_as(roi_cls_loc)
+            cls_bbox = loc2bbox(at.tonumpy(roi).reshape((-1, 4)),
+                                at.tonumpy(roi_cls_loc).reshape((-1, 4)))
+            cls_bbox = at.totensor(cls_bbox)
+            cls_bbox = cls_bbox.view(-1, self.n_class * 4)
+            # clip bounding box
+            cls_bbox[:, 0::2] = (cls_bbox[:, 0::2]).clamp(min=0, max=size[0])
+            cls_bbox[:, 1::2] = (cls_bbox[:, 1::2]).clamp(min=0, max=size[1])
+
+            prob = at.tonumpy(F.softmax(at.tovariable(roi_score), dim=1))
+
+            raw_cls_bbox = at.tonumpy(cls_bbox)
+            raw_prob = at.tonumpy(prob)
+
+            bbox, label, score = self._suppress(raw_cls_bbox, raw_prob)
+            bboxes.append(bbox)
+            labels.append(label)
+            scores.append(score)
+
+        # self.use_preset('evaluate')
+        # self.train()
+        return bboxes, labels, scores
+
+    def get_loss(self,inputs,isLearnNMS):
+        gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores, \
+        sample_roi, roi_cls_loc, roi_score, appearance_features, img_size, labels, bboxes = self(inputs)
+        if(isLearnNMS):
+            rpn_loss = self.rpnLoss(gt_rpn_loc,gt_rpn_label,  rpn_locs, rpn_scores)
+            roi_loss = self.roiLoss(gt_roi_loc, gt_roi_label,roi_cls_loc, roi_score)
+            nms_scores, sorted_labels, sorted_cls_bboxes = self.duplicate_remover(sample_roi, roi_cls_loc, roi_score,
+                                                                                  appearance_features, img_size)
+            nms_loss = self.nmsLoss(bboxes, labels,nms_scores, sorted_labels, sorted_cls_bboxes)
+            losses = rpn_loss+roi_loss+nms_loss
+            losses = [sum(losses)]+losses
+            return losses
+        else:
+            rpn_loss = self.rpnLoss(gt_rpn_loc, gt_rpn_label, rpn_locs, rpn_scores)
+            roi_loss = self.roiLoss(gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score)
+            losses = rpn_loss + roi_loss
+            losses = [sum(losses)]+losses
+            return losses
 
 class RegionProposalNetwork(nn.Module):
     """Region Proposal Network introduced in Faster R-CNN.
@@ -553,7 +661,7 @@ class RoIPooling2D(nn.Module):
         return self.RoI(x, rois)
 
 class DuplicationRemovalNetwork(nn.Module):
-    def __init__(self,n_relations = 16, appearance_feature_dim=1024,num_classes=20):
+    def __init__(self,n_relations = 16, appearance_feature_dim=1024,num_classes=20,d_f=128):
         super(DuplicationRemovalNetwork, self).__init__()
         self.loc_normalize_mean = (0., 0., 0., 0.)
         self.loc_normalize_std = (0.1, 0.1, 0.2, 0.2)
@@ -562,11 +670,11 @@ class DuplicationRemovalNetwork(nn.Module):
         self.appearance_feature_dim=appearance_feature_dim
         self.n_class = num_classes+1
 
-        self.nms_rank_fc = nn.Linear(appearance_feature_dim, appearance_feature_dim, bias=True)
-        self.roi_feat_embedding_fc = nn.Linear(appearance_feature_dim,appearance_feature_dim,bias=True)
-        self.relation_module = RelationModule(n_relations=n_relations,appearance_feature_dim=appearance_feature_dim,
-                                              key_feature_dim=int(appearance_feature_dim/n_relations),
-                                              geo_feature_dim=int(appearance_feature_dim/n_relations))
+        self.nms_rank_fc = nn.Linear(appearance_feature_dim, d_f, bias=True)
+        self.roi_feat_embedding_fc = nn.Linear(appearance_feature_dim,d_f,bias=True)
+        self.relation_module = RelationModule(n_relations=n_relations,appearance_feature_dim=d_f,
+                                              key_feature_dim=64,
+                                              geo_feature_dim=64,isDuplication=True)
 
         self.nms_logit_fc = nn.Linear(appearance_feature_dim,1,bias=True)
         self.sigmoid = nn.Sigmoid()
@@ -620,7 +728,7 @@ class DuplicationRemovalNetwork(nn.Module):
             roi_feat_embedding = self.roi_feat_embedding_fc(sorted_features)
             nms_embedding_feat = nms_rank + roi_feat_embedding
             position_embedding = PositionalEmbedding(sorted_cls_bboxes,dim_g = self.geo_feature_dim)
-            nms_logit = self.relation_module(nms_embedding_feat,position_embedding)
+            nms_logit = self.relation_module([sorted_features, nms_embedding_feat,position_embedding])
             nms_logit = self.nms_logit_fc(nms_logit)
             s1 = self.sigmoid(nms_logit).view(-1)
             nms_scores = s1 * sorted_prob
@@ -628,21 +736,32 @@ class DuplicationRemovalNetwork(nn.Module):
             return nms_scores, sorted_labels-1, sorted_cls_bboxes
 
 class RelationModule(nn.Module):
-    def __init__(self,n_relations = 16, appearance_feature_dim=1024,key_feature_dim = 64, geo_feature_dim = 64):
+    def __init__(self,n_relations = 16, appearance_feature_dim=1024,key_feature_dim = 64, geo_feature_dim = 64, isDuplication = False):
         super(RelationModule, self).__init__()
+        self.isDuplication=isDuplication
         self.Nr = n_relations
         self.dim_g = geo_feature_dim
         self.relation = nn.ModuleList()
         for N in range(self.Nr):
             self.relation.append(RelationUnit(appearance_feature_dim, key_feature_dim, geo_feature_dim))
-    def forward(self, f_a, position_embedding):
+    def forward(self, input_data ):
+        if(self.isDuplication):
+            f_a, embedding_f_a, position_embedding =input_data
+        else:
+            f_a, position_embedding = input_data
         isFirst=True
         for N in range(self.Nr):
             if(isFirst):
-                concat = self.relation[N](f_a,position_embedding)
+                if(self.isDuplication):
+                    concat = self.relation[N](embedding_f_a,position_embedding)
+                else:
+                    concat = self.relation[N](f_a,position_embedding)
                 isFirst=False
             else:
-                concat = torch.cat((concat,self.relation[N](f_a,position_embedding)),-1)
+                if(self.isDuplication):
+                    concat = torch.cat((concat, self.relation[N](embedding_f_a, position_embedding)), -1)
+                else:
+                    concat = torch.cat((concat, self.relation[N](f_a, position_embedding)), -1)
         return concat+f_a
 class RelationUnit(nn.Module):
     def __init__(self, appearance_feature_dim=1024,key_feature_dim = 64, geo_feature_dim = 64):
@@ -760,12 +879,12 @@ class RoIHead(nn.Module):
         fc1 = self.relu1(fc1)
 
         if(self.n_relations>0):
-            fc1 = self.relation1(fc1,position_embedding)
+            fc1 = self.relation1([fc1,position_embedding])
 
         fc2 = self.fully_connected2(fc1)
         fc2 = self.relu2(fc2)
         if(self.n_relations>0):
-            fc2 = self.relation2(fc2,position_embedding)
+            fc2 = self.relation2([fc2,position_embedding])
 
         roi_cls_locs = self.cls_loc(fc2)
         roi_scores = self.score(fc2)

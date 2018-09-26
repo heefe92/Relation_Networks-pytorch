@@ -1,8 +1,6 @@
 import numpy as np
-import numpy as xp
 
 import six
-from six import __init__
 
 
 def loc2bbox(src_bbox, loc):
@@ -49,7 +47,7 @@ def loc2bbox(src_bbox, loc):
     """
 
     if src_bbox.shape[0] == 0:
-        return xp.zeros((0, 4), dtype=loc.dtype)
+        return np.zeros((0, 4), dtype=loc.dtype)
 
     src_bbox = src_bbox.astype(src_bbox.dtype, copy=False)
 
@@ -61,12 +59,12 @@ def loc2bbox(src_bbox, loc):
     dx = loc[:, 1::4]
     dh = loc[:, 2::4]
     dw = loc[:, 3::4]
-    ctr_y = dy * src_height[:, xp.newaxis] + src_ctr_y[:, xp.newaxis]
-    ctr_x = dx * src_width[:, xp.newaxis] + src_ctr_x[:, xp.newaxis]
-    h = xp.exp(dh) * src_height[:, xp.newaxis]
-    w = xp.exp(dw) * src_width[:, xp.newaxis]
+    ctr_y = dy * src_height[:, xp.newaxis] + src_ctr_y[:, np.newaxis]
+    ctr_x = dx * src_width[:, xp.newaxis] + src_ctr_x[:, np.newaxis]
+    h = np.exp(dh) * src_height[:, xp.newaxis]
+    w = np.exp(dw) * src_width[:, xp.newaxis]
 
-    dst_bbox = xp.zeros(loc.shape, dtype=loc.dtype)
+    dst_bbox = np.zeros(loc.shape, dtype=loc.dtype)
     dst_bbox[:, 0::4] = ctr_y - 0.5 * h
     dst_bbox[:, 1::4] = ctr_x - 0.5 * w
     dst_bbox[:, 2::4] = ctr_y + 0.5 * h
