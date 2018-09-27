@@ -60,6 +60,8 @@ class Trainer():
                         ' of group {} to {:.4e}.'.format( i, new_lr))
 
     def model_freeze(self,freeze_num):
+        if(freeze_num == -1):
+            return
         child_count = 0
         for child in self.my_model.children():
             if(child_count < freeze_num):

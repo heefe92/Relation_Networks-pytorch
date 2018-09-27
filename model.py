@@ -10,7 +10,7 @@ from collections import namedtuple
 from string import Template
 import lib.array_tool as at
 from config import opt
-from data.dataset import preprocess
+from data.dataset import preprocess, VGGpreprocess
 from lib.bbox_tools import loc2bbox
 
 import torch as t
@@ -19,21 +19,18 @@ from torch.autograd import Function
 from lib.roi_cupy import kernel_backward, kernel_forward
 from lib.creator_tool import ProposalCreator, ProposalTargetCreator, AnchorTargetCreator
 from lib.relation_tool import PositionalEmbedding, RankEmbedding
-Stream = namedtuple('Stream', ['ptr'])
+from torchvision.models import vgg16_bn,squeezenet1_1
 
 
-model_urls = {
-    'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
-    'resnet34': 'https://download.pytorch.org/models/resnet34-333f7ec4.pth',
-    'resnet50': 'https://download.pytorch.org/models/resnet50-19c8e357.pth',
-    'resnet101': 'https://download.pytorch.org/models/resnet101-5d3b4d8f.pth',
-    'resnet152': 'https://download.pytorch.org/models/resnet152-b121ed2d.pth',
-}
+
 
 import torch
 import torch.nn as nn
 import numpy as np
 import cupy as cp
+
+
+Stream = namedtuple('Stream', ['ptr'])
 
 @cp.util.memoize(for_each_device=True)
 def load_kernel(kernel_name, code, **kwargs):
@@ -46,85 +43,35 @@ CUDA_NUM_THREADS = 1024
 
 def GET_BLOCKS(N, K=CUDA_NUM_THREADS):
     return (N + K - 1) // K
-class ResNet(nn.Module):
-    feat_stride = 32  # downsample 32x for output of convolution resnet
-    def __init__(self, num_classes, block, layers):
-        self.training=False
-        self.inplanes = 64
+
+class SqueezeFRCN(nn.Module):
+    feat_stride = 16  # downsample 16x for output of convolution squeeze
+    def __init__(self, num_classes):
+        super(SqueezeFRCN, self).__init__()
         self.loc_normalize_mean = (0., 0., 0., 0.)
         self.loc_normalize_std = (0.1, 0.1, 0.2, 0.2)
-        self.n_class = num_classes+1
+        self.n_class = num_classes +1
+        self.training = False
 
-        super(ResNet, self).__init__()
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        model = squeezenet1_1(pretrained=True)
+        self.feature_extractor = model.features
 
-        if block == BasicBlock:
-            fpn_sizes = [self.layer2[layers[1]-1].conv2.out_channels, self.layer3[layers[2]-1].conv2.out_channels,
-                         self.layer4[layers[3]-1].conv2.out_channels]
-            self.conv2 = nn.Conv2d(self.layer4[layers[3]-1].conv2.out_channels, 512, kernel_size=1, stride=1, bias=False)
-        elif block == Bottleneck:
-            fpn_sizes = [self.layer2[layers[1]-1].conv3.out_channels, self.layer3[layers[2]-1].conv3.out_channels,
-                         self.layer4[layers[3]-1].conv3.out_channels]
-            self.conv2 = nn.Conv2d(self.layer4[layers[3]-1].conv3.out_channels, 512, kernel_size=1, stride=1, bias=False)
+        # freeze
+        for layer in self.feature_extractor[:5]:
+            for p in layer.parameters():
+                p.requires_grad = False
 
-        #self.fpn = PyramidFeatures(fpn_sizes[0], fpn_sizes[1], fpn_sizes[2],feature_size = 512)
+        self.rpn = RegionProposalNetwork(in_channels=512, mid_channels=512, feat_stride=self.feat_stride)
+        self.roi_head = RoIHead(n_class=self.n_class, roi_size=7, spatial_scale=(1. / self.feat_stride),
+                                in_channels=512, fc_features=512, n_relations=0)
 
-        self.rpn = RegionProposalNetwork(in_channels=512,mid_channels=512,feat_stride = self.feat_stride)
-        self.roi_head = RoIHead(n_class = num_classes+1,roi_size=7,spatial_scale=(1. / self.feat_stride),
-                                in_channels=512,fc_features = 1024, n_relations= 16)
-        self.duplicate_remover = DuplicationRemovalNetwork(n_relations=16,appearance_feature_dim=1024,
-                                                           num_classes=num_classes)
         self.proposal_target_creator = ProposalTargetCreator()
         self.anchor_target_creator = AnchorTargetCreator()
 
         self.roiLoss = ROILoss()
         self.rpnLoss = RPNLoss()
-        self.nmsLoss = RelationNetworksLoss()
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-                m.weight.data.normal_(0, math.sqrt(2. / n))
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
 
-
-        self.freeze_bn()
-    def use_preset(self,isTraining,preset='visualize'):
-        if preset == 'visualize':
-            self.nms_thresh = 0.3
-            self.score_thresh = 0.7
-        elif preset == 'evaluate':
-            self.nms_thresh = 0.3
-            self.score_thresh = 0.5
-        self.training=isTraining
-    def _make_layer(self, block, planes, blocks, stride=1):
-        downsample = None
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, planes * block.expansion,
-                          kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(planes * block.expansion),
-            )
-        layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample))
-        self.inplanes = planes * block.expansion
-        for i in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
-        return nn.Sequential(*layers)
-    def freeze_bn(self):
-        '''Freeze BatchNorm layers.'''
-        for layer in self.modules():
-            if isinstance(layer, nn.BatchNorm2d):
-                layer.eval()
-    def forward(self, inputs, scale=1.):
+    def forward(self,inputs,scale = 1.):
         if self.training:
             img_batch, bboxes, labels, _ = inputs
         else:
@@ -132,19 +79,9 @@ class ResNet(nn.Module):
 
         _, _, H, W = img_batch.shape
         img_size = (H, W)
-        x = self.conv1(img_batch)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-        x1 = self.layer1(x)
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        x4 = self.layer4(x3)
-
-        #features = self.fpn([x2, x3, x4])
-        features = self.conv2(x4)
-        rpn_locs, rpn_scores, rois, roi_indices, anchor = self.rpn(features,img_size,scale)
-
+        start = time.time()
+        features = self.feature_extractor(img_batch)
+        rpn_locs, rpn_scores, rois, roi_indices, anchor = self.rpn(features, img_size, scale)
         if self.training:
             gt_rpn_loc, gt_rpn_label = self.anchor_target_creator(
                 at.tonumpy(bboxes[0]),
@@ -160,78 +97,55 @@ class ResNet(nn.Module):
 
             roi_cls_loc, roi_score, appearance_features = self.roi_head(features, sample_roi, sample_roi_index)
 
-            return gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores,\
-                   sample_roi, roi_cls_loc, roi_score, appearance_features, img_size,labels, bboxes
-
-            # nms_scores, sorted_labels, sorted_cls_bboxes =self.duplicate_remover(sample_roi,roi_cls_loc, roi_score, appearance_features,img_size)
-            # return self.Loss(gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs,
-            #                  rpn_scores)
-            # if(nms_scores is None):
-            #     return [0.,0.,0.,0.,0.]
-            #     return self.Loss(gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs,
-            #                       rpn_scores)
-            # else:
-            #     result_loss=[0.,0.,0.,0.,0.]
-            #     #result_loss = self.Loss(gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores)
-            #
-            #     result_loss[4]+=self.nmsLoss(bboxes, labels,nms_scores, sorted_labels, sorted_cls_bboxes)
-            #     return result_loss
+            return gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores, \
+                   sample_roi, roi_cls_loc, roi_score, appearance_features, img_size, labels, bboxes
         else:
             roi_cls_loc, roi_score, appearance_features = self.roi_head(features, rois, roi_indices)
-            # nms_scores, sorted_labels, sorted_cls_bboxes = self.duplicate_remover(rois, roi_cls_loc, roi_score,
-            #                                                                       appearance_features, img_size)
-            #return nms_scores, sorted_labels, sorted_cls_bboxes
-            return roi_cls_loc,roi_score, rois, roi_indices, appearance_features, img_size
 
-    def _suppress(self, raw_cls_bbox, raw_prob):
-        bbox = list()
-        label = list()
-        score = list()
-        # skip cls_id = 0 because it is the background class
-        for l in range(1, self.n_class):
-            cls_bbox_l = raw_cls_bbox.reshape((-1, self.n_class, 4))[:, l, :]
-            prob_l = raw_prob[:, l]
-            mask = prob_l > self.score_thresh
-            cls_bbox_l = cls_bbox_l[mask]
-            prob_l = prob_l[mask]
-            keep = non_maximum_suppression(
-                cp.array(cls_bbox_l), self.nms_thresh, prob_l)
-            keep = cp.asnumpy(keep)
-            bbox.append(cls_bbox_l[keep])
-            # The labels are in [0, self.n_class - 2].
-            label.append((l - 1) * np.ones((len(keep),)))
-            score.append(prob_l[keep])
-        bbox = np.concatenate(bbox, axis=0).astype(np.float32)
-        label = np.concatenate(label, axis=0).astype(np.int32)
-        score = np.concatenate(score, axis=0).astype(np.float32)
-        return bbox, label, score
+            return roi_cls_loc, roi_score, rois, roi_indices, appearance_features, img_size
+    def get_loss(self,inputs,isLearnNMS):
+        gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores, \
+        sample_roi, roi_cls_loc, roi_score, appearance_features, img_size, labels, bboxes = self(inputs)
+        if(isLearnNMS):
+            rpn_loss = self.rpnLoss(gt_rpn_loc,gt_rpn_label,  rpn_locs, rpn_scores)
+            roi_loss = self.roiLoss(gt_roi_loc, gt_roi_label,roi_cls_loc, roi_score)
+            nms_scores, sorted_labels, sorted_cls_bboxes = self.duplicate_remover(sample_roi, roi_cls_loc, roi_score,
+                                                                                  appearance_features, img_size)
+            nms_loss = self.nmsLoss(bboxes, labels,nms_scores, sorted_labels, sorted_cls_bboxes)
+            losses = rpn_loss+roi_loss+nms_loss
+            losses = [sum(losses)]+losses
+            return losses
+        else:
+            rpn_loss = self.rpnLoss(gt_rpn_loc, gt_rpn_label, rpn_locs, rpn_scores)
+            roi_loss = self.roiLoss(gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score)
+            losses = rpn_loss + roi_loss
+            losses = [sum(losses)]+losses
+            return losses
     def predict(self, imgs, sizes=None, visualize=False):
         if visualize:
             self.use_preset(isTraining=False, preset='visualize')
             prepared_imgs = list()
-            sizes = list()
             for img in imgs:
                 size = img.shape[1:]
-                img = preprocess(at.tonumpy(img))
+                img = VGGpreprocess(at.tonumpy(img))
                 prepared_imgs.append(img)
-                sizes.append(size)
         else:
             self.use_preset(isTraining=False, preset='evaluate')
             prepared_imgs = imgs
+
         bboxes = list()
         labels = list()
         scores = list()
-        for img, size in zip(prepared_imgs, sizes):
+        for img in prepared_imgs:
             img = t.autograd.Variable(at.totensor(img).float()[None], volatile=True)
-            scale = img.shape[3] / size[1]
-            roi_cls_loc, roi_scores, rois, _ = self(img, scale=scale)
+            size = img.shape[2:]
+            scale = np.array(1.)
+            roi_cls_loc, roi_scores, rois, _,_ ,_ = self(img, scale=scale)
             # We are assuming that batch size is 1.
             roi_score = roi_scores.data
             roi_cls_loc = roi_cls_loc.data
-            if visualize:
-                roi = at.totensor(rois) / scale
-            else:
-                roi = at.totensor(rois) / scale.cuda().float()
+
+            roi = at.totensor(rois)
 
             # Convert predictions to bounding boxes in image coordinates.
             # Bounding boxes are scaled to the scale of the input images.
@@ -261,9 +175,127 @@ class ResNet(nn.Module):
             labels.append(label)
             scores.append(score)
 
-        # self.use_preset('evaluate')
-        # self.train()
         return bboxes, labels, scores
+
+    def _suppress(self, raw_cls_bbox, raw_prob):
+        bbox = list()
+        label = list()
+        score = list()
+        # skip cls_id = 0 because it is the background class
+        for l in range(1, self.n_class):
+            cls_bbox_l = raw_cls_bbox.reshape((-1, self.n_class, 4))[:, l, :]
+            prob_l = raw_prob[:, l]
+            mask = prob_l > self.score_thresh
+            cls_bbox_l = cls_bbox_l[mask]
+            prob_l = prob_l[mask]
+            keep = non_maximum_suppression(
+                cp.array(cls_bbox_l), self.nms_thresh, prob_l)
+            keep = cp.asnumpy(keep)
+            bbox.append(cls_bbox_l[keep])
+            # The labels are in [0, self.n_class - 2].
+            label.append((l - 1) * np.ones((len(keep),)))
+            score.append(prob_l[keep])
+        bbox = np.concatenate(bbox, axis=0).astype(np.float32)
+        label = np.concatenate(label, axis=0).astype(np.int32)
+        score = np.concatenate(score, axis=0).astype(np.float32)
+        return bbox, label, score
+    def freeze_bn(self):
+        '''Freeze BatchNorm layers.'''
+        for layer in self.modules():
+            if isinstance(layer, nn.BatchNorm2d):
+                layer.eval()
+    def use_preset(self,isTraining,preset='visualize'):
+        if preset == 'visualize':
+            self.nms_thresh = 0.3
+            self.score_thresh = 0.7
+        elif preset == 'evaluate':
+            self.nms_thresh = 0.3
+            self.score_thresh = 0.05
+        self.training=isTraining
+    def get_optimizer(self):
+        """
+        return optimizer, It could be overwriten if you want to specify
+        special optimizer
+        """
+        lr = opt.lr
+        params = []
+        for key, value in dict(self.named_parameters()).items():
+            if value.requires_grad:
+                if 'bias' in key:
+                    params += [{'params': [value], 'lr': lr * 2, 'weight_decay': 0}]
+                else:
+                    params += [{'params': [value], 'lr': lr, 'weight_decay': opt.weight_decay}]
+        if(opt.use_adam):
+            optimizer = t.optim.Adam(params)
+        else:
+            optimizer = t.optim.SGD(params,momentum = 0.9)
+        return optimizer
+class VGGFRCN(nn.Module):
+    feat_stride = 16  # downsample 16x for output of conv5 in vgg16
+    def __init__(self, num_classes):
+        super(VGGFRCN, self).__init__()
+        self.loc_normalize_mean = (0., 0., 0., 0.)
+        self.loc_normalize_std = (0.1, 0.1, 0.2, 0.2)
+        self.n_class = num_classes+1
+        self.training = False
+        model = vgg16_bn(pretrained=True)
+        self.feature_extractor = model.features[:43]
+        # freeze top4 conv
+        for layer in self.feature_extractor[:14]:
+            for p in layer.parameters():
+                p.requires_grad = False
+
+        classifier = model.classifier
+        del classifier[6]
+        del classifier[5]
+        del classifier[2]
+        classifier = nn.Sequential(*classifier)
+
+        self.rpn = RegionProposalNetwork(in_channels=512, mid_channels=512, feat_stride=self.feat_stride)
+
+        self.roi_head = RoIHead(n_class=self.n_class, roi_size=7, spatial_scale=(1. / self.feat_stride), n_relations=0,
+                                in_channels=512, fc_features=4096, classifier = classifier)
+
+        self.proposal_target_creator = ProposalTargetCreator()
+        self.anchor_target_creator = AnchorTargetCreator()
+
+        self.roiLoss = ROILoss()
+        self.rpnLoss = RPNLoss()
+        self.freeze_bn()
+    def forward(self,inputs, scale=1.):
+        if self.training:
+            img_batch, bboxes, labels, _ = inputs
+        else:
+            img_batch = inputs
+
+        _, _, H, W = img_batch.shape
+        img_size = (H, W)
+
+        features = self.feature_extractor(img_batch)
+        rpn_locs, rpn_scores, rois, roi_indices, anchor = self.rpn(features, img_size, scale)
+
+        if self.training:
+            gt_rpn_loc, gt_rpn_label = self.anchor_target_creator(
+                at.tonumpy(bboxes[0]),
+                anchor,
+                img_size)
+            sample_roi, gt_roi_loc, gt_roi_label = self.proposal_target_creator(
+                rois,
+                at.tonumpy(bboxes[0]),
+                at.tonumpy(labels[0]),
+                self.loc_normalize_mean,
+                self.loc_normalize_std)
+            sample_roi_index = t.zeros(len(sample_roi))
+
+            roi_cls_loc, roi_score, appearance_features = self.roi_head(features, sample_roi, sample_roi_index)
+
+            return gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores, \
+                   sample_roi, roi_cls_loc, roi_score, appearance_features, img_size, labels, bboxes
+
+        else:
+            roi_cls_loc, roi_score, appearance_features = self.roi_head(features, rois, roi_indices)
+
+            return roi_cls_loc, roi_score, rois, roi_indices, appearance_features, img_size
 
     def get_loss(self,inputs,isLearnNMS):
         gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores, \
@@ -283,6 +315,338 @@ class ResNet(nn.Module):
             losses = rpn_loss + roi_loss
             losses = [sum(losses)]+losses
             return losses
+    def predict(self, imgs, sizes=None, visualize=False):
+        if visualize:
+            self.use_preset(isTraining=False, preset='visualize')
+            prepared_imgs = list()
+            for img in imgs:
+                size = img.shape[1:]
+                img = VGGpreprocess(at.tonumpy(img))
+                prepared_imgs.append(img)
+        else:
+            self.use_preset(isTraining=False, preset='evaluate')
+            prepared_imgs = imgs
+
+        bboxes = list()
+        labels = list()
+        scores = list()
+        for img in prepared_imgs:
+            img = t.autograd.Variable(at.totensor(img).float()[None], volatile=True)
+            size = img.shape[2:]
+            scale = np.array(1.)
+            roi_cls_loc, roi_scores, rois, _,_ ,_ = self(img, scale=scale)
+            # We are assuming that batch size is 1.
+            roi_score = roi_scores.data
+            roi_cls_loc = roi_cls_loc.data
+
+            roi = at.totensor(rois)
+
+            # Convert predictions to bounding boxes in image coordinates.
+            # Bounding boxes are scaled to the scale of the input images.
+            mean = t.Tensor(self.loc_normalize_mean).cuda(). \
+                repeat(self.n_class)[None]
+            std = t.Tensor(self.loc_normalize_std).cuda(). \
+                repeat(self.n_class)[None]
+
+            roi_cls_loc = (roi_cls_loc * std + mean)
+            roi_cls_loc = roi_cls_loc.view(-1, self.n_class, 4)
+            roi = roi.view(-1, 1, 4).expand_as(roi_cls_loc)
+            cls_bbox = loc2bbox(at.tonumpy(roi).reshape((-1, 4)),
+                                at.tonumpy(roi_cls_loc).reshape((-1, 4)))
+            cls_bbox = at.totensor(cls_bbox)
+            cls_bbox = cls_bbox.view(-1, self.n_class * 4)
+            # clip bounding box
+            cls_bbox[:, 0::2] = (cls_bbox[:, 0::2]).clamp(min=0, max=size[0])
+            cls_bbox[:, 1::2] = (cls_bbox[:, 1::2]).clamp(min=0, max=size[1])
+
+            prob = at.tonumpy(F.softmax(at.tovariable(roi_score), dim=1))
+
+            raw_cls_bbox = at.tonumpy(cls_bbox)
+            raw_prob = at.tonumpy(prob)
+
+            bbox, label, score = self._suppress(raw_cls_bbox, raw_prob)
+            bboxes.append(bbox)
+            labels.append(label)
+            scores.append(score)
+
+        return bboxes, labels, scores
+
+    def _suppress(self, raw_cls_bbox, raw_prob):
+        bbox = list()
+        label = list()
+        score = list()
+        # skip cls_id = 0 because it is the background class
+        for l in range(1, self.n_class):
+            cls_bbox_l = raw_cls_bbox.reshape((-1, self.n_class, 4))[:, l, :]
+            prob_l = raw_prob[:, l]
+            mask = prob_l > self.score_thresh
+            cls_bbox_l = cls_bbox_l[mask]
+            prob_l = prob_l[mask]
+            keep = non_maximum_suppression(
+                cp.array(cls_bbox_l), self.nms_thresh, prob_l)
+            keep = cp.asnumpy(keep)
+            bbox.append(cls_bbox_l[keep])
+            # The labels are in [0, self.n_class - 2].
+            label.append((l - 1) * np.ones((len(keep),)))
+            score.append(prob_l[keep])
+        bbox = np.concatenate(bbox, axis=0).astype(np.float32)
+        label = np.concatenate(label, axis=0).astype(np.int32)
+        score = np.concatenate(score, axis=0).astype(np.float32)
+        return bbox, label, score
+    def freeze_bn(self):
+        '''Freeze BatchNorm layers.'''
+        for layer in self.modules():
+            if isinstance(layer, nn.BatchNorm2d):
+                layer.eval()
+    def use_preset(self,isTraining,preset='visualize'):
+        if preset == 'visualize':
+            self.nms_thresh = 0.3
+            self.score_thresh = 0.7
+        elif preset == 'evaluate':
+            self.nms_thresh = 0.3
+            self.score_thresh = 0.05
+        self.training=isTraining
+    def get_optimizer(self):
+        """
+        return optimizer, It could be overwriten if you want to specify
+        special optimizer
+        """
+        lr = opt.lr
+        params = []
+        for key, value in dict(self.named_parameters()).items():
+            if value.requires_grad:
+                if 'bias' in key:
+                    params += [{'params': [value], 'lr': lr * 2, 'weight_decay': 0}]
+                else:
+                    params += [{'params': [value], 'lr': lr, 'weight_decay': opt.weight_decay}]
+        if(opt.use_adam):
+            optimizer = t.optim.Adam(params)
+        else:
+            optimizer = t.optim.SGD(params,momentum = 0.9)
+        return optimizer
+
+# class ResFRCN(nn.Module):
+#     feat_stride = 16  # downsample 32x for output of convolution resnet
+#     def __init__(self, num_classes, block, layers):
+#         self.training=False
+#         self.inplanes = 64
+#         self.loc_normalize_mean = (0., 0., 0., 0.)
+#         self.loc_normalize_std = (0.1, 0.1, 0.2, 0.2)
+#         self.n_class = num_classes+1
+#
+#         super(ResFRCN, self).__init__()
+#         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+#         self.bn1 = nn.BatchNorm2d(64)
+#         self.relu = nn.ReLU(inplace=True)
+#         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+#         self.layer1 = self._make_layer(block, 64, layers[0])
+#         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+#         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+#         self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+#
+#         if block == BasicBlock:
+#             fpn_sizes = [self.layer2[layers[1]-1].conv2.out_channels, self.layer3[layers[2]-1].conv2.out_channels,
+#                          self.layer4[layers[3]-1].conv2.out_channels]
+#             self.conv2 = nn.Conv2d(self.layer4[layers[3]-1].conv2.out_channels, 512, kernel_size=1, stride=1, bias=False)
+#         elif block == Bottleneck:
+#             fpn_sizes = [self.layer2[layers[1]-1].conv3.out_channels, self.layer3[layers[2]-1].conv3.out_channels,
+#                          self.layer4[layers[3]-1].conv3.out_channels]
+#             self.conv2 = nn.Conv2d(self.layer4[layers[3]-1].conv3.out_channels, 512, kernel_size=1, stride=1, bias=False)
+#
+#         #self.fpn = PyramidFeatures(fpn_sizes[0], fpn_sizes[1], fpn_sizes[2],feature_size = 512)
+#
+#         self.rpn = RegionProposalNetwork(in_channels=512,mid_channels=512,feat_stride = self.feat_stride)
+#         self.roi_head = RoIHead(n_class = num_classes+1,roi_size=7,spatial_scale=(1. / self.feat_stride),
+#                                 in_channels=512,fc_features = 1024, n_relations= 16)
+#         self.duplicate_remover = DuplicationRemovalNetwork(n_relations=16,appearance_feature_dim=1024,
+#                                                            num_classes=num_classes)
+#         self.proposal_target_creator = ProposalTargetCreator()
+#         self.anchor_target_creator = AnchorTargetCreator()
+#
+#         self.roiLoss = ROILoss()
+#         self.rpnLoss = RPNLoss()
+#         self.nmsLoss = RelationNetworksLoss()
+#         for m in self.modules():
+#             if isinstance(m, nn.Conv2d):
+#                 n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+#                 m.weight.data.normal_(0, math.sqrt(2. / n))
+#             elif isinstance(m, nn.BatchNorm2d):
+#                 m.weight.data.fill_(1)
+#                 m.bias.data.zero_()
+#
+#
+#         self.freeze_bn()
+#     def use_preset(self,isTraining,preset='visualize'):
+#         if preset == 'visualize':
+#             self.nms_thresh = 0.3
+#             self.score_thresh = 0.7
+#         elif preset == 'evaluate':
+#             self.nms_thresh = 0.3
+#             self.score_thresh = 0.5
+#         self.training=isTraining
+#     def _make_layer(self, block, planes, blocks, stride=1):
+#         downsample = None
+#         if stride != 1 or self.inplanes != planes * block.expansion:
+#             downsample = nn.Sequential(
+#                 nn.Conv2d(self.inplanes, planes * block.expansion,
+#                           kernel_size=1, stride=stride, bias=False),
+#                 nn.BatchNorm2d(planes * block.expansion),
+#             )
+#         layers = []
+#         layers.append(block(self.inplanes, planes, stride, downsample))
+#         self.inplanes = planes * block.expansion
+#         for i in range(1, blocks):
+#             layers.append(block(self.inplanes, planes))
+#         return nn.Sequential(*layers)
+#     def freeze_bn(self):
+#         '''Freeze BatchNorm layers.'''
+#         for layer in self.modules():
+#             if isinstance(layer, nn.BatchNorm2d):
+#                 layer.eval()
+#     def forward(self, inputs, scale=1.):
+#         if self.training:
+#             img_batch, bboxes, labels, _ = inputs
+#         else:
+#             img_batch = inputs
+#
+#         _, _, H, W = img_batch.shape
+#         img_size = (H, W)
+#         x = self.conv1(img_batch)
+#         x = self.bn1(x)
+#         x = self.relu(x)
+#         x = self.maxpool(x)
+#         x1 = self.layer1(x)
+#         x2 = self.layer2(x1)
+#         x3 = self.layer3(x2)
+#         x4 = self.layer4(x3)
+#
+#         #features = self.fpn([x2, x3, x4])
+#         features = self.conv2(x4)
+#         rpn_locs, rpn_scores, rois, roi_indices, anchor = self.rpn(features,img_size,scale)
+#
+#         if self.training:
+#             gt_rpn_loc, gt_rpn_label = self.anchor_target_creator(
+#                 at.tonumpy(bboxes[0]),
+#                 anchor,
+#                 img_size)
+#             sample_roi, gt_roi_loc, gt_roi_label = self.proposal_target_creator(
+#                 rois,
+#                 at.tonumpy(bboxes[0]),
+#                 at.tonumpy(labels[0]),
+#                 self.loc_normalize_mean,
+#                 self.loc_normalize_std)
+#             sample_roi_index = t.zeros(len(sample_roi))
+#
+#             roi_cls_loc, roi_score, appearance_features = self.roi_head(features, sample_roi, sample_roi_index)
+#
+#             return gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores,\
+#                    sample_roi, roi_cls_loc, roi_score, appearance_features, img_size,labels, bboxes
+#
+#         else:
+#             roi_cls_loc, roi_score, appearance_features = self.roi_head(features, rois, roi_indices)
+#
+#             return roi_cls_loc,roi_score, rois, roi_indices, appearance_features, img_size
+#
+#     def _suppress(self, raw_cls_bbox, raw_prob):
+#         bbox = list()
+#         label = list()
+#         score = list()
+#         # skip cls_id = 0 because it is the background class
+#         for l in range(1, self.n_class):
+#             cls_bbox_l = raw_cls_bbox.reshape((-1, self.n_class, 4))[:, l, :]
+#             prob_l = raw_prob[:, l]
+#             mask = prob_l > self.score_thresh
+#             cls_bbox_l = cls_bbox_l[mask]
+#             prob_l = prob_l[mask]
+#             keep = non_maximum_suppression(
+#                 cp.array(cls_bbox_l), self.nms_thresh, prob_l)
+#             keep = cp.asnumpy(keep)
+#             bbox.append(cls_bbox_l[keep])
+#             # The labels are in [0, self.n_class - 2].
+#             label.append((l - 1) * np.ones((len(keep),)))
+#             score.append(prob_l[keep])
+#         bbox = np.concatenate(bbox, axis=0).astype(np.float32)
+#         label = np.concatenate(label, axis=0).astype(np.int32)
+#         score = np.concatenate(score, axis=0).astype(np.float32)
+#         return bbox, label, score
+#     def predict(self, imgs, sizes=None, visualize=False):
+#         if visualize:
+#             self.use_preset(isTraining=False, preset='visualize')
+#             prepared_imgs = list()
+#             sizes = list()
+#             for img in imgs:
+#                 size = img.shape[1:]
+#                 img = preprocess(at.tonumpy(img))
+#                 prepared_imgs.append(img)
+#                 sizes.append(size)
+#         else:
+#             self.use_preset(isTraining=False, preset='evaluate')
+#             prepared_imgs = imgs
+#         bboxes = list()
+#         labels = list()
+#         scores = list()
+#         for img, size in zip(prepared_imgs, sizes):
+#             img = t.autograd.Variable(at.totensor(img).float()[None], volatile=True)
+#             scale = img.shape[3] / size[1]
+#             roi_cls_loc, roi_scores, rois, _ = self(img, scale=scale)
+#             # We are assuming that batch size is 1.
+#             roi_score = roi_scores.data
+#             roi_cls_loc = roi_cls_loc.data
+#             if visualize:
+#                 roi = at.totensor(rois) / scale
+#             else:
+#                 roi = at.totensor(rois) / scale.cuda().float()
+#
+#             # Convert predictions to bounding boxes in image coordinates.
+#             # Bounding boxes are scaled to the scale of the input images.
+#             mean = t.Tensor(self.loc_normalize_mean).cuda(). \
+#                 repeat(self.n_class)[None]
+#             std = t.Tensor(self.loc_normalize_std).cuda(). \
+#                 repeat(self.n_class)[None]
+#
+#             roi_cls_loc = (roi_cls_loc * std + mean)
+#             roi_cls_loc = roi_cls_loc.view(-1, self.n_class, 4)
+#             roi = roi.view(-1, 1, 4).expand_as(roi_cls_loc)
+#             cls_bbox = loc2bbox(at.tonumpy(roi).reshape((-1, 4)),
+#                                 at.tonumpy(roi_cls_loc).reshape((-1, 4)))
+#             cls_bbox = at.totensor(cls_bbox)
+#             cls_bbox = cls_bbox.view(-1, self.n_class * 4)
+#             # clip bounding box
+#             cls_bbox[:, 0::2] = (cls_bbox[:, 0::2]).clamp(min=0, max=size[0])
+#             cls_bbox[:, 1::2] = (cls_bbox[:, 1::2]).clamp(min=0, max=size[1])
+#
+#             prob = at.tonumpy(F.softmax(at.tovariable(roi_score), dim=1))
+#
+#             raw_cls_bbox = at.tonumpy(cls_bbox)
+#             raw_prob = at.tonumpy(prob)
+#
+#             bbox, label, score = self._suppress(raw_cls_bbox, raw_prob)
+#             bboxes.append(bbox)
+#             labels.append(label)
+#             scores.append(score)
+#
+#         # self.use_preset('evaluate')
+#         # self.train()
+#         return bboxes, labels, scores
+#
+#     def get_loss(self,inputs,isLearnNMS):
+#         gt_rpn_loc, gt_rpn_label, gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score, rpn_locs, rpn_scores, \
+#         sample_roi, roi_cls_loc, roi_score, appearance_features, img_size, labels, bboxes = self(inputs)
+#         if(isLearnNMS):
+#             rpn_loss = self.rpnLoss(gt_rpn_loc,gt_rpn_label,  rpn_locs, rpn_scores)
+#             roi_loss = self.roiLoss(gt_roi_loc, gt_roi_label,roi_cls_loc, roi_score)
+#             nms_scores, sorted_labels, sorted_cls_bboxes = self.duplicate_remover(sample_roi, roi_cls_loc, roi_score,
+#                                                                                   appearance_features, img_size)
+#             nms_loss = self.nmsLoss(bboxes, labels,nms_scores, sorted_labels, sorted_cls_bboxes)
+#             losses = rpn_loss+roi_loss+nms_loss
+#             losses = [sum(losses)]+losses
+#             return losses
+#         else:
+#             rpn_loss = self.rpnLoss(gt_rpn_loc, gt_rpn_label, rpn_locs, rpn_scores)
+#             roi_loss = self.roiLoss(gt_roi_loc, gt_roi_label, roi_cls_loc, roi_score)
+#             losses = rpn_loss + roi_loss
+#             losses = [sum(losses)]+losses
+#             return losses
 
 class RegionProposalNetwork(nn.Module):
     """Region Proposal Network introduced in Faster R-CNN.
@@ -484,122 +848,7 @@ class RegionProposalNetwork(nn.Module):
                  shift.reshape((1, K, 4)).transpose((1, 0, 2))
         anchor = anchor.reshape((K * A, 4)).astype(np.float32)
         return anchor
-def conv3x3(in_planes, out_planes, stride=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=1, bias=False)
-class BasicBlock(nn.Module):
-    expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(BasicBlock, self).__init__()
-        self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        residual = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-
-        if self.downsample is not None:
-            residual = self.downsample(x)
-
-        out += residual
-        out = self.relu(out)
-
-        return out
-class Bottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
-                               padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(planes * 4)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        residual = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
-
-        if self.downsample is not None:
-            residual = self.downsample(x)
-
-        out += residual
-        out = self.relu(out)
-
-        return out
-class PyramidFeatures(nn.Module):
-    def __init__(self, C3_size, C4_size, C5_size, feature_size=256):
-        super(PyramidFeatures, self).__init__()
-
-        # upsample C5 to get P5 from the FPN paper
-        self.P3_1 = nn.Conv2d(C3_size, feature_size, kernel_size=1, stride=1, padding=0)
-        self.P3_2 = nn.ReLU(inplace=True)
-        self.P3_downsampled = nn.MaxPool2d(2, stride=2,padding=0)
-        # add P5 elementwise to C4
-        self.P4_1 = nn.Conv2d(C4_size, feature_size, kernel_size=1, stride=1, padding=0)
-        self.P4_2 = nn.ReLU(inplace=True)
-        self.P4_3 = nn.Conv2d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
-        self.P4_4 = nn.ReLU(inplace=True)
-        self.P4_downsampled = nn.MaxPool2d(2, stride=2,padding=0)
-
-
-        # add P4 elementwise to C3
-        self.P5_1 = nn.Conv2d(C5_size, feature_size, kernel_size=1, stride=1, padding=0)
-        self.P5_2 = nn.ReLU(inplace=True)
-        self.P5_3 = nn.Conv2d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
-        self.P5_4 = nn.ReLU(inplace=True)
-
-    def forward(self, inputs):
-
-        C3, C4, C5 = inputs
-
-        P3_x = self.P3_1(C3)
-        P3_x = self.P3_2(P3_x)
-        P3_downsampled_x = self.P3_downsampled(P3_x)
-
-
-        P4_x = self.P4_1(C4)
-        P4_x = self.P4_2(P4_x)
-        P4_x = P3_downsampled_x + P4_x
-        P4_x = self.P4_3(P4_x)
-        P4_x = self.P4_4(P4_x)
-        P4_downsampled_x = self.P4_downsampled(P4_x)
-
-        P5_x = self.P5_1(C5)
-        P5_x = self.P5_2(P5_x)
-        P5_x = P4_downsampled_x + P5_x
-        P5_x = self.P5_3(P5_x)
-        P5_x = self.P5_4(P5_x)
-
-        return P5_x
 class RoI(Function):
     """
     NOTE：only CUDA-compatible
@@ -734,7 +983,6 @@ class DuplicationRemovalNetwork(nn.Module):
             nms_scores = s1 * sorted_prob
 
             return nms_scores, sorted_labels-1, sorted_cls_bboxes
-
 class RelationModule(nn.Module):
     def __init__(self,n_relations = 16, appearance_feature_dim=1024,key_feature_dim = 64, geo_feature_dim = 64, isDuplication = False):
         super(RelationModule, self).__init__()
@@ -805,6 +1053,7 @@ class RelationUnit(nn.Module):
 
         output = torch.sum(output,-2)
         return output
+
 class RoIHead(nn.Module):
     """Faster R-CNN Head for VGG-16 based implementation.
     This class is used as a head for Faster R-CNN.
@@ -820,26 +1069,35 @@ class RoIHead(nn.Module):
     """
 
     def __init__(self, n_class, roi_size, spatial_scale,
-                 in_channels = 128,fc_features = 1024, n_relations = 16):
+                 in_channels = 128,fc_features = 1024, n_relations = 0 , classifier = None):
         # n_class includes the background
         super(RoIHead, self).__init__()
-        self.n_relations=n_relations
-        self.fully_connected1 = nn.Linear(7*7*in_channels, fc_features)
-        self.relu1 = nn.ReLU(inplace=True)
-        if(n_relations>0):
-            self.dim_g = int(fc_features/n_relations)
-            self.relation1= RelationModule(n_relations = n_relations, appearance_feature_dim=fc_features,
-                                       key_feature_dim = self.dim_g, geo_feature_dim = self.dim_g)
+        if classifier is None:
+            self.n_relations=n_relations
+            fully_connected1 = nn.Linear(7*7*in_channels, fc_features)
+            relu1 = nn.ReLU(inplace=True)
 
-        self.fully_connected2 = nn.Linear(fc_features, fc_features)
-        self.relu2 = nn.ReLU(inplace=True)
-        if(n_relations>0):
-            self.relation2= RelationModule(n_relations = n_relations, appearance_feature_dim=fc_features,
-                                       key_feature_dim = self.dim_g, geo_feature_dim = self.dim_g)
+            fully_connected2 = nn.Linear(fc_features, fc_features)
+            relu2 = nn.ReLU(inplace=True)
+            if(n_relations>0):
+                self.dim_g = int(fc_features/n_relations)
+                relation1= RelationModule(n_relations = n_relations, appearance_feature_dim=fc_features,
+                                           key_feature_dim = self.dim_g, geo_feature_dim = self.dim_g)
+
+                relation2 = RelationModule(n_relations=n_relations, appearance_feature_dim=fc_features,
+                                            key_feature_dim=self.dim_g, geo_feature_dim=self.dim_g)
+                self.classifier = nn.Sequential(fully_connected1, relu1, relation1,
+                                                fully_connected2, relu2, relation2)
+            else:
+                self.classifier = nn.Sequential(fully_connected1, relu1,
+                                                fully_connected2, relu2)
+        else :
+            self.classifier = classifier
 
         self.cls_loc = nn.Linear(fc_features, n_class * 4)
         self.score = nn.Linear(fc_features, n_class)
-
+        normal_init(self.cls_loc, 0, 0.001)
+        normal_init(self.score, 0, 0.01)
         self.n_class = n_class
         self.roi_size = roi_size
         self.spatial_scale = spatial_scale
@@ -875,67 +1133,81 @@ class RoIHead(nn.Module):
         pool = self.roi(x, indices_and_rois)
 
         pool = pool.view(pool.size(0), -1)
-        fc1 = self.fully_connected1(pool)
-        fc1 = self.relu1(fc1)
 
-        if(self.n_relations>0):
-            fc1 = self.relation1([fc1,position_embedding])
+        fc7 = self.classifier(pool)
+        roi_cls_locs = self.cls_loc(fc7)
+        roi_scores = self.score(fc7)
+        return roi_cls_locs, roi_scores, fc7
 
-        fc2 = self.fully_connected2(fc1)
-        fc2 = self.relu2(fc2)
-        if(self.n_relations>0):
-            fc2 = self.relation2([fc2,position_embedding])
+class VGG16RoIHead(nn.Module):
+    """Faster R-CNN Head for VGG-16 based implementation.
+    This class is used as a head for Faster R-CNN.
+    This outputs class-wise localizations and classification based on feature
+    maps in the given RoIs.
 
-        roi_cls_locs = self.cls_loc(fc2)
-        roi_scores = self.score(fc2)
-        return roi_cls_locs, roi_scores, fc2
-
-def resnet18(num_classes, pretrained=False, **kwargs):
-    """Constructs a ResNet-18 model.
     Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
+        n_class (int): The number of classes possibly including the background.
+        roi_size (int): Height and width of the feature maps after RoI-pooling.
+        spatial_scale (float): Scale of the roi is resized.
+        classifier (nn.Module): Two layer Linear ported from vgg16
     """
-    model = ResNet(num_classes, BasicBlock, [2, 2, 2, 2], **kwargs)
-    if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet18'], model_dir='.'), strict=False)
-    return model
 
-def resnet34(num_classes, pretrained=False, **kwargs):
-    """Constructs a ResNet-34 model.
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-    """
-    model = ResNet(num_classes, BasicBlock, [3, 4, 6, 3], **kwargs)
-    if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet34'], model_dir='.'), strict=False)
-    return model
+    def __init__(self, n_class, roi_size, spatial_scale,
+                 classifier):
+        # n_class includes the background
+        super(VGG16RoIHead, self).__init__()
 
-def resnet50(num_classes, pretrained=False, **kwargs):
-    """Constructs a ResNet-50 model.
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-    """
-    model = ResNet(num_classes, Bottleneck, [3, 4, 6, 3], **kwargs)
-    if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet50'], model_dir='.'), strict=False)
-    return model
+        self.classifier = classifier
+        self.cls_loc = nn.Linear(4096, n_class * 4)
+        self.score = nn.Linear(4096, n_class)
 
-def resnet101(num_classes, pretrained=False, **kwargs):
-    """Constructs a ResNet-101 model.
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-    """
-    model = ResNet(num_classes, Bottleneck, [3, 4, 23, 3], **kwargs)
-    if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet101'], model_dir='.'), strict=False)
-    return model
+        normal_init(self.cls_loc, 0, 0.001)
+        normal_init(self.score, 0, 0.01)
 
-def resnet152(num_classes, pretrained=False, **kwargs):
-    """Constructs a ResNet-152 model.
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
+        self.n_class = n_class
+        self.roi_size = roi_size
+        self.spatial_scale = spatial_scale
+        self.roi = RoIPooling2D(self.roi_size, self.roi_size, self.spatial_scale)
+
+    def forward(self, x, rois, roi_indices):
+        """Forward the chain.
+
+        We assume that there are :math:`N` batches.
+
+        Args:
+            x (Variable): 4D image variable.
+            rois (Tensor): A bounding box array containing coordinates of
+                proposal boxes.  This is a concatenation of bounding box
+                arrays from multiple images in the batch.
+                Its shape is :math:`(R', 4)`. Given :math:`R_i` proposed
+                RoIs from the :math:`i` th image,
+                :math:`R' = \\sum _{i=1} ^ N R_i`.
+            roi_indices (Tensor): An array containing indices of images to
+                which bounding boxes correspond to. Its shape is :math:`(R',)`.
+
+        """
+        # in case roi_indices is  ndarray
+        roi_indices = at.totensor(roi_indices).float()
+        rois = at.totensor(rois).float()
+        indices_and_rois = t.cat([roi_indices[:, None], rois], dim=1)
+        # NOTE: important: yx->xy
+        xy_indices_and_rois = indices_and_rois[:, [0, 2, 1, 4, 3]]
+        indices_and_rois =  xy_indices_and_rois.contiguous()
+
+        pool = self.roi(x, indices_and_rois)
+        pool = pool.view(pool.size(0), -1)
+        fc7 = self.classifier(pool)
+        roi_cls_locs = self.cls_loc(fc7)
+        roi_scores = self.score(fc7)
+        return roi_cls_locs, roi_scores, fc7
+
+def normal_init(m, mean, stddev, truncated=False):
     """
-    model = ResNet(num_classes, Bottleneck, [3, 8, 36, 3], **kwargs)
-    if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet152'], model_dir='.'), strict=False)
-    return model
+    weight initalizer: truncated normal and random normal.
+    """
+    # x is a parameter
+    if truncated:
+        m.weight.data.normal_().fmod_(2).mul_(stddev).add_(mean)  # not a perfect approximation
+    else:
+        m.weight.data.normal_(mean, stddev)
+        m.bias.data.zero_()
