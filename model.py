@@ -998,18 +998,13 @@ class RelationModule(nn.Module):
         else:
             f_a, position_embedding = input_data
         isFirst=True
+        concat = []
         for N in range(self.Nr):
-            if(isFirst):
-                if(self.isDuplication):
-                    concat = self.relation[N](embedding_f_a,position_embedding)
-                else:
-                    concat = self.relation[N](f_a,position_embedding)
-                isFirst=False
+            if(self.isDuplication):
+                concat.append(self.relation[N](embedding_f_a,position_embedding))
             else:
-                if(self.isDuplication):
-                    concat = torch.cat((concat, self.relation[N](embedding_f_a, position_embedding)), -1)
-                else:
-                    concat = torch.cat((concat, self.relation[N](f_a, position_embedding)), -1)
+                concat.append(self.relation[N](f_a,position_embedding))
+        concat = torch.cat(concat, dim=-1)
         return concat+f_a
 class RelationUnit(nn.Module):
     def __init__(self, appearance_feature_dim=1024,key_feature_dim = 64, geo_feature_dim = 64):
